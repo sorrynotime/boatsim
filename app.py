@@ -8,6 +8,7 @@ from tkinter import messagebox, ttk
 from boat_sim.model import BoatParameters, DifferentialBoat, GpsSensor, gps_to_local, local_to_gps
 from boat_sim.protocol import encode_sensor, encode_target
 from boat_sim.serial_link import SerialLink
+from boat_sim.signal_mapping import map_motor_commands, map_yaw_rate
 
 
 SIM_DT = 0.01
@@ -26,14 +27,19 @@ class BoatSimulatorApp:
         self.sim_time = 0.0
         self.accumulator = 0.0
         self.last_tick = time.perf_counter()
+        self.last_draw = self.last_tick
         self.last_gps_time = -GPS_PERIOD_S
         self.last_sensor_send = -SIM_DT
         self.sequence = 0
         self.latest_gps = (30.000000, 120.000000)
         self.true_path: list[tuple[float, float]] = []
         self.gps_path: list[tuple[float, float]] = []
+        self.ekf_path: list[tuple[float, float]] = []
+        self.latest_ekf_gps: tuple[float, float] | None = None
+        self.last_ekf_frame: tuple[int, int] | None = None
         self.arrival_since: float | None = None
         self.arrived = False
+        self.view_extent = 10.0
         self.vars: dict[str, tk.Variable] = {}
         self._build_ui()
         self._refresh_ports()
@@ -82,12 +88,28 @@ class BoatSimulatorApp:
         self._entry(location, "目标北向 (m)", "target_north", 30.0)
         self._entry(location, "到达半径 (m)", "arrival_radius", 2.0)
         self._entry(location, "GPS 精度半径 (m)", "gps_accuracy", 1.5)
-        ttk.Button(location, text="下发目标", command=self._send_target).pack(fill="x", pady=(6, 0))
+        target_actions = ttk.Frame(location)
+        target_actions.pack(fill="x", pady=(6, 0))
+        ttk.Button(target_actions, text="下发目标", command=self._send_target).pack(side="left", fill="x", expand=True)
+        ttk.Button(target_actions, text="复制 sim target", command=self._copy_target_coordinates).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.picked_coordinate_var = tk.StringVar(value="sim target 30.0002695 120.0002075")
+        ttk.Label(location, textvariable=self.picked_coordinate_var).pack(fill="x", pady=(6, 0))
 
         motors = ttk.LabelFrame(controls, text="手动电机 (-10000..10000)", padding=8)
         motors.pack(fill="x", pady=(8, 0))
         self._scale(motors, "左", "manual_left")
         self._scale(motors, "右", "manual_right")
+
+        mapping = ttk.LabelFrame(controls, text="方向映射", padding=8)
+        mapping.pack(fill="x", pady=(8, 0))
+        self.invert_gyro = tk.BooleanVar(value=False)
+        self.swap_motors = tk.BooleanVar(value=False)
+        self.invert_left_motor = tk.BooleanVar(value=False)
+        self.invert_right_motor = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mapping, text="陀螺仪角速度取反", variable=self.invert_gyro).pack(anchor="w")
+        ttk.Checkbutton(mapping, text="交换左右电机", variable=self.swap_motors).pack(anchor="w")
+        ttk.Checkbutton(mapping, text="左电机取反", variable=self.invert_left_motor).pack(anchor="w")
+        ttk.Checkbutton(mapping, text="右电机取反", variable=self.invert_right_motor).pack(anchor="w")
 
         self.telemetry_var = tk.StringVar()
         ttk.Label(controls, textvariable=self.telemetry_var, justify="left").pack(fill="x", pady=(10, 0))
@@ -95,6 +117,7 @@ class BoatSimulatorApp:
         self.canvas = tk.Canvas(plot_frame, background="#f7fafc", highlightthickness=1, highlightbackground="#9ca3af")
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _event: self._draw())
+        self.canvas.bind("<Button-1>", self._pick_target)
 
     def _entry(self, parent: ttk.Widget, label: str, key: str, default: float) -> None:
         row = ttk.Frame(parent)
@@ -161,30 +184,94 @@ class BoatSimulatorApp:
         self.last_sensor_send = -SIM_DT
         self.true_path.clear()
         self.gps_path.clear()
+        self.ekf_path.clear()
+        self.latest_ekf_gps = None
+        self.last_ekf_frame = None
         self.arrival_since = None
         self.arrived = False
+        self.view_extent = 10.0
         self.vars["manual_left"].set(0)
         self.vars["manual_right"].set(0)
         self._draw()
 
     def _send_target(self) -> None:
         try:
-            latitude, longitude = local_to_gps(
-                self._value("target_east"), self._value("target_north"), self._value("lat0"), self._value("lon0")
-            )
+            latitude, longitude = self._update_picked_coordinate()
             frame = encode_target(self.sequence, int(self.sim_time * 1000), latitude, longitude, self._value("arrival_radius"))
             self.sequence += 1
             self.link.send(frame)
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("目标参数错误", str(exc))
 
-    def _motor_values(self) -> tuple[int, int, str]:
+    def _target_gps(self) -> tuple[float, float]:
+        return local_to_gps(
+            self._value("target_east"), self._value("target_north"), self._value("lat0"), self._value("lon0")
+        )
+
+    def _update_picked_coordinate(self) -> tuple[float, float]:
+        latitude, longitude = self._target_gps()
+        self.picked_coordinate_var.set(self._format_target_command(latitude, longitude))
+        return latitude, longitude
+
+    @staticmethod
+    def _format_target_command(latitude: float, longitude: float) -> str:
+        return f"sim target {latitude:.7f} {longitude:.7f}"
+
+    def _copy_target_coordinates(self) -> None:
+        try:
+            latitude, longitude = self._update_picked_coordinate()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self._format_target_command(latitude, longitude))
+            self.status_var.set("sim target 命令已复制")
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("目标参数错误", str(exc))
+
+    def _pick_target(self, event: tk.Event) -> None:
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        scale = getattr(self, "view_scale", 1.0)
+        east = (event.x - width / 2) / scale
+        north = (height / 2 - event.y) / scale
+        self.vars["target_east"].set(round(east, 3))
+        self.vars["target_north"].set(round(north, 3))
+        self._update_picked_coordinate()
+        self._draw()
+
+    def _raw_motor_values(self) -> tuple[int, int, str]:
         if self.manual_mode.get():
             return int(self.vars["manual_left"].get()), int(self.vars["manual_right"].get()), "手动"
         command = self.link.motor_command()
         if command is None:
             return 0, 0, "串口超时，电机归零"
-        return max(-10000, min(10000, command.left)), max(-10000, min(10000, command.right)), "MCU"
+        return command.left, command.right, "MCU"
+
+    def _motor_values(self) -> tuple[int, int, str]:
+        left, right, source = self._raw_motor_values()
+        left, right = map_motor_commands(
+            left,
+            right,
+            swap=self.swap_motors.get(),
+            invert_left=self.invert_left_motor.get(),
+            invert_right=self.invert_right_motor.get(),
+        )
+        return left, right, source
+
+    def _capture_ekf_point(self) -> None:
+        position = self.link.ekf_position()
+        if position is None:
+            return
+        frame_key = (position.sequence, position.mcu_time_ms)
+        if frame_key == self.last_ekf_frame:
+            return
+        self.last_ekf_frame = frame_key
+        latitude = position.ekf_latitude_deg
+        longitude = position.ekf_longitude_deg
+        if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0):
+            return
+        self.latest_ekf_gps = (latitude, longitude)
+        point = gps_to_local(latitude, longitude, self._value("lat0"), self._value("lon0"))
+        if not self.ekf_path or math.dist(self.ekf_path[-1], point) >= 0.03:
+            self.ekf_path.append(point)
 
     def _simulate_step(self) -> None:
         left, right, _ = self._motor_values()
@@ -193,6 +280,8 @@ class BoatSimulatorApp:
         state = self.boat.state
         if not self.true_path or math.dist(self.true_path[-1], (state.east_m, state.north_m)) >= 0.05:
             self.true_path.append((state.east_m, state.north_m))
+            if len(self.true_path) > 50_000:
+                del self.true_path[:10_000]
         gps_new = self.sim_time - self.last_gps_time >= GPS_PERIOD_S - 1e-9
         if gps_new:
             self.last_gps_time = self.sim_time
@@ -201,7 +290,8 @@ class BoatSimulatorApp:
         if self.sim_time - self.last_sensor_send >= SIM_DT - 1e-9:
             self.last_sensor_send = self.sim_time
             frame = encode_sensor(
-                self.sequence, int(self.sim_time * 1000), gps_new, state.yaw_rad, state.yaw_rate_rps,
+                self.sequence, int(self.sim_time * 1000), gps_new, state.yaw_rad,
+                map_yaw_rate(state.yaw_rate_rps, invert=self.invert_gyro.get()),
                 self.latest_gps[0], self.latest_gps[1], self._value("gps_accuracy"),
             )
             self.sequence += 1
@@ -218,38 +308,60 @@ class BoatSimulatorApp:
         now = time.perf_counter()
         elapsed = min(0.1, now - self.last_tick)
         self.last_tick = now
+        self._capture_ekf_point()
         if self.running:
             self.accumulator += elapsed
             while self.accumulator >= SIM_DT:
                 self._simulate_step()
                 self.accumulator -= SIM_DT
-        self._draw()
+        if now - self.last_draw >= 0.1:
+            self.last_draw = now
+            self._draw()
         self.root.after(20, self._tick)
+
+    @staticmethod
+    def _display_points(points: list[tuple[float, float]], limit: int = 3000) -> list[tuple[float, float]]:
+        if len(points) <= limit:
+            return points
+        step = math.ceil(len(points) / limit)
+        sampled = points[::step]
+        if sampled[-1] != points[-1]:
+            sampled.append(points[-1])
+        return sampled
 
     def _draw(self) -> None:
         canvas = self.canvas
         width, height = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
         canvas.delete("all")
         target = (self._value("target_east"), self._value("target_north"))
-        points = self.true_path + [(0.0, 0.0), target]
-        max_extent = max(10.0, *(abs(v) for point in points for v in point)) * 1.2
-        scale = min(width, height) / (2.0 * max_extent)
+        points = self.true_path + self.ekf_path + [(0.0, 0.0), target]
+        required_extent = max(10.0, *(abs(v) for point in points for v in point)) * 1.2
+        self.view_extent = max(self.view_extent, required_extent)
+        scale = min(width, height) / (2.0 * self.view_extent)
+        self.view_scale = scale
 
         def xy(east: float, north: float) -> tuple[float, float]:
             return width / 2 + east * scale, height / 2 - north * scale
 
-        grid_step = 5 if max_extent <= 40 else 10 if max_extent <= 100 else 50
-        limit = int(max_extent // grid_step) * grid_step
+        grid_step = 5 if self.view_extent <= 40 else 10 if self.view_extent <= 100 else 50
+        limit = int(self.view_extent // grid_step) * grid_step
         for value in range(-limit, limit + 1, grid_step):
             x, _ = xy(value, 0)
             _, y = xy(0, value)
             canvas.create_line(x, 0, x, height, fill="#e5e7eb")
             canvas.create_line(0, y, width, y, fill="#e5e7eb")
         if len(self.true_path) >= 2:
-            canvas.create_line(*(coord for point in self.true_path for coord in xy(*point)), fill="#2563eb", width=2)
+            display_path = self._display_points(self.true_path)
+            canvas.create_line(*(coord for point in display_path for coord in xy(*point)), fill="#2563eb", width=2)
         for point in self.gps_path[-100:]:
             gx, gy = xy(*point)
             canvas.create_oval(gx - 3, gy - 3, gx + 3, gy + 3, fill="#f59e0b", outline="")
+        if len(self.ekf_path) >= 2:
+            display_ekf = self._display_points(self.ekf_path)
+            canvas.create_line(*(coord for point in display_ekf for coord in xy(*point)), fill="#16a34a", width=2)
+        for point in self.ekf_path[-200:]:
+            ex, ey = xy(*point)
+            canvas.create_oval(ex - 2, ey - 2, ex + 2, ey + 2, fill="#16a34a", outline="")
         tx, ty = xy(*target)
         radius_px = max(3, self._value("arrival_radius") * scale)
         canvas.create_oval(tx - radius_px, ty - radius_px, tx + radius_px, ty + radius_px, outline="#16a34a", width=2)
@@ -265,18 +377,25 @@ class BoatSimulatorApp:
         right_y = by - math.cos(state.yaw_rad - 2.45) * 11
         canvas.create_polygon(bow_x, bow_y, left_x, left_y, right_x, right_y, fill="#dc2626", outline="#7f1d1d")
         distance = math.hypot(state.east_m - target[0], state.north_m - target[1])
-        left, right, source = self._motor_values()
+        raw_left, raw_right, source = self._raw_motor_values()
+        left, right, _ = self._motor_values()
         link_state = "串口已连接" if self.link.connected else "串口未连接"
         run_state = "运行" if self.running else "停止"
         arrived = " / 已到达" if self.arrived else ""
+        ekf_text = (
+            f"{self.latest_ekf_gps[0]:.7f}, {self.latest_ekf_gps[1]:.7f}"
+            if self.latest_ekf_gps is not None else "--"
+        )
         self.status_var.set(f"{link_state} / {run_state}{arrived}")
         self.telemetry_var.set(
-            f"输入：{source}\n左/右：{left} / {right}\n"
+            f"输入：{source}\n原始左/右：{raw_left} / {raw_right}\n仿真左/右：{left} / {right}\n"
             f"东/北：{state.east_m:.2f} / {state.north_m:.2f} m\n"
             f"航向：{state.yaw_rad:.3f} rad\n速度：{state.speed_mps:.2f} m/s\n"
             f"角速度：{state.yaw_rate_rps:.2f} rad/s\n目标距离：{distance:.2f} m\n"
             f"GPS：{self.latest_gps[0]:.7f}, {self.latest_gps[1]:.7f}\n"
-            f"MCU 帧：{self.link.stats.received_frames}"
+            f"EKF：{ekf_text}\n"
+            f"电机帧：{self.link.stats.received_motor_frames}\n"
+            f"EKF 帧：{self.link.stats.received_ekf_frames}"
         )
 
     def _close(self) -> None:

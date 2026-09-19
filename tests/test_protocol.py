@@ -1,8 +1,11 @@
 import unittest
 
 from boat_sim.protocol import (
+    EKF_POSITION_PAYLOAD,
+    EkfPosition,
     FrameParser,
     MOTOR_PAYLOAD,
+    MSG_EKF_POSITION,
     MSG_MOTOR_COMMAND,
     SENSOR_PAYLOAD,
     encode_frame,
@@ -24,6 +27,15 @@ class ProtocolTests(unittest.TestCase):
         frame = bytearray(encode_frame(MSG_MOTOR_COMMAND, 1, MOTOR_PAYLOAD.pack(1, 2, 3)))
         frame[-1] ^= 0xFF
         self.assertEqual(FrameParser().feed_motor_commands(frame), [])
+
+    def test_parser_decodes_separate_ekf_frame(self):
+        payload = EKF_POSITION_PAYLOAD.pack(2000, 301234567, 1207654321)
+        frame = encode_frame(MSG_EKF_POSITION, 9, payload)
+        messages = FrameParser().feed_messages(frame)
+        self.assertEqual(len(messages), 1)
+        self.assertIsInstance(messages[0], EkfPosition)
+        self.assertAlmostEqual(messages[0].ekf_latitude_deg, 30.1234567)
+        self.assertAlmostEqual(messages[0].ekf_longitude_deg, 120.7654321)
 
     def test_sensor_uses_integer_e7_coordinates(self):
         frame = encode_sensor(7, 10, True, 0.5, -0.25, 30.1234567, 120.7654321, 1.5)

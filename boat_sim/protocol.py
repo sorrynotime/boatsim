@@ -9,12 +9,14 @@ VERSION = 1
 MSG_SENSOR_STATE = 0x01
 MSG_TARGET = 0x02
 MSG_MOTOR_COMMAND = 0x81
+MSG_EKF_POSITION = 0x82
 FLAG_GPS_NEW = 0x0001
 
 HEADER = struct.Struct("<2sBBHH")
 SENSOR_PAYLOAD = struct.Struct("<IHffiif")
 TARGET_PAYLOAD = struct.Struct("<Iiif")
 MOTOR_PAYLOAD = struct.Struct("<Ihh")
+EKF_POSITION_PAYLOAD = struct.Struct("<Iii")
 
 
 def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
@@ -75,6 +77,22 @@ class MotorCommand:
     right: int
 
 
+@dataclass(frozen=True)
+class EkfPosition:
+    sequence: int
+    mcu_time_ms: int
+    ekf_latitude_e7: int
+    ekf_longitude_e7: int
+
+    @property
+    def ekf_latitude_deg(self) -> float:
+        return self.ekf_latitude_e7 / 10_000_000.0
+
+    @property
+    def ekf_longitude_deg(self) -> float:
+        return self.ekf_longitude_e7 / 10_000_000.0
+
+
 class FrameParser:
     def __init__(self) -> None:
         self.buffer = bytearray()
@@ -107,10 +125,16 @@ class FrameParser:
             del self.buffer[:frame_length]
         return frames
 
-    def feed_motor_commands(self, data: bytes) -> list[MotorCommand]:
-        commands: list[MotorCommand] = []
+    def feed_messages(self, data: bytes) -> list[MotorCommand | EkfPosition]:
+        messages: list[MotorCommand | EkfPosition] = []
         for message_type, sequence, payload in self.feed(data):
             if message_type == MSG_MOTOR_COMMAND and len(payload) == MOTOR_PAYLOAD.size:
                 time_ms, left, right = MOTOR_PAYLOAD.unpack(payload)
-                commands.append(MotorCommand(sequence, time_ms, left, right))
-        return commands
+                messages.append(MotorCommand(sequence, time_ms, left, right))
+            elif message_type == MSG_EKF_POSITION and len(payload) == EKF_POSITION_PAYLOAD.size:
+                time_ms, latitude_e7, longitude_e7 = EKF_POSITION_PAYLOAD.unpack(payload)
+                messages.append(EkfPosition(sequence, time_ms, latitude_e7, longitude_e7))
+        return messages
+
+    def feed_motor_commands(self, data: bytes) -> list[MotorCommand]:
+        return [message for message in self.feed_messages(data) if isinstance(message, MotorCommand)]

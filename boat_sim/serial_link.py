@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import threading
 import time
 
-from .protocol import FrameParser, MotorCommand
+from .protocol import EkfPosition, FrameParser, MotorCommand
 
 try:
     import serial
@@ -17,6 +17,8 @@ except ImportError:  # The simulator remains usable in manual mode.
 class LinkStats:
     received_frames: int = 0
     last_motor_monotonic: float = 0.0
+    received_motor_frames: int = 0
+    received_ekf_frames: int = 0
     error: str = ""
 
 
@@ -26,6 +28,7 @@ class SerialLink:
         self.parser = FrameParser()
         self.stats = LinkStats()
         self.latest_motor: MotorCommand | None = None
+        self.latest_ekf: EkfPosition | None = None
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self.running = False
@@ -44,9 +47,13 @@ class SerialLink:
         if serial is None:
             raise RuntimeError("pyserial is not installed; run: pip install -r requirements.txt")
         self.disconnect()
+        self.parser = FrameParser()
         self.port = serial.Serial(port_name, 921600, timeout=0.01, write_timeout=0.1)
         self.running = True
         self.stats = LinkStats()
+        with self.lock:
+            self.latest_motor = None
+            self.latest_ekf = None
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
 
@@ -55,6 +62,9 @@ class SerialLink:
         port, self.port = self.port, None
         if port is not None:
             port.close()
+        thread, self.thread = self.thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
 
     def send(self, frame: bytes) -> None:
         port = self.port
@@ -67,6 +77,10 @@ class SerialLink:
                 return None
             return self.latest_motor
 
+    def ekf_position(self) -> EkfPosition | None:
+        with self.lock:
+            return self.latest_ekf
+
     def _read_loop(self) -> None:
         while self.running:
             try:
@@ -74,11 +88,16 @@ class SerialLink:
                 if port is None:
                     return
                 data = port.read(max(1, port.in_waiting))
-                for command in self.parser.feed_motor_commands(data):
+                for message in self.parser.feed_messages(data):
                     with self.lock:
-                        self.latest_motor = command
                         self.stats.received_frames += 1
-                        self.stats.last_motor_monotonic = time.monotonic()
+                        if isinstance(message, MotorCommand):
+                            self.latest_motor = message
+                            self.stats.received_motor_frames += 1
+                            self.stats.last_motor_monotonic = time.monotonic()
+                        else:
+                            self.latest_ekf = message
+                            self.stats.received_ekf_frames += 1
             except Exception as exc:
                 self.stats.error = str(exc)
                 self.running = False

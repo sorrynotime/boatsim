@@ -1,7 +1,8 @@
 # MCU serial protocol
 
-UART configuration: `921600 8N1`, little-endian. The MCU and PC normally send
-one frame every 10 ms. Multi-byte fields use little-endian byte order.
+UART configuration: `921600 8N1`, little-endian. Real-time sensor and motor
+frames are normally sent every 10 ms. Multi-byte fields use little-endian byte
+order. Low-rate messages such as EKF position use their own schedule.
 
 ## Common frame
 
@@ -34,6 +35,10 @@ Sent every 10 ms. Latitude and longitude hold the most recent GPS fix; bit 0 of
 | 18 | int32 | longitude | degrees x 1e-7 |
 | 22 | float32 | GPS accuracy radius | m, approximate 95% radius |
 
+The simulator's **Invert gyro yaw rate** option changes the sign of the
+`yaw rate` field only. It does not change the true trajectory or the `yaw`
+heading field.
+
 ## PC to MCU: target (`type = 0x02`, 16-byte payload)
 
 Sent after connection and whenever the operator presses **Send target**.
@@ -59,3 +64,17 @@ Sent every 10 ms. Both motor values are clamped by the PC to
 If no valid motor frame is received for 200 ms, the simulator sets both motor
 commands to zero. The MCU should apply the same watchdog rule to stale sensor
 frames.
+
+## MCU to PC: EKF position (`type = 0x82`, 12-byte payload)
+
+Send this frame every 500 ms (2 Hz). A 1-second period (1 Hz) is also supported.
+It is deliberately separate from the real-time motor frame.
+
+| Payload offset | Type | Field | Unit |
+|---:|---|---|---|
+| 0 | uint32 | MCU time | ms |
+| 4 | int32 | EKF latitude | degrees x 1e-7 |
+| 8 | int32 | EKF longitude | degrees x 1e-7 |
+
+The EKF coordinate is plotted in green. Repeating an unchanged position is
+allowed; the PC suppresses duplicate display points.
