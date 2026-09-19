@@ -12,7 +12,7 @@ MSG_MOTOR_COMMAND = 0x81
 FLAG_GPS_NEW = 0x0001
 
 HEADER = struct.Struct("<2sBBHH")
-SENSOR_PAYLOAD = struct.Struct("<IHfiif")
+SENSOR_PAYLOAD = struct.Struct("<IHffiif")
 TARGET_PAYLOAD = struct.Struct("<Iiif")
 MOTOR_PAYLOAD = struct.Struct("<Ihh")
 
@@ -37,6 +37,7 @@ def encode_sensor(
     time_ms: int,
     gps_new: bool,
     yaw_rad: float,
+    yaw_rate_rps: float,
     latitude_deg: float,
     longitude_deg: float,
     accuracy_m: float,
@@ -45,6 +46,7 @@ def encode_sensor(
         time_ms & 0xFFFFFFFF,
         FLAG_GPS_NEW if gps_new else 0,
         yaw_rad,
+        yaw_rate_rps,
         round(latitude_deg * 10_000_000),
         round(longitude_deg * 10_000_000),
         accuracy_m,

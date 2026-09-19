@@ -201,7 +201,7 @@ class BoatSimulatorApp:
         if self.sim_time - self.last_sensor_send >= SIM_DT - 1e-9:
             self.last_sensor_send = self.sim_time
             frame = encode_sensor(
-                self.sequence, int(self.sim_time * 1000), gps_new, state.yaw_rad,
+                self.sequence, int(self.sim_time * 1000), gps_new, state.yaw_rad, state.yaw_rate_rps,
                 self.latest_gps[0], self.latest_gps[1], self._value("gps_accuracy"),
             )
             self.sequence += 1

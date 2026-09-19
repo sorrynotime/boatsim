@@ -19,7 +19,7 @@ CRC parameters: polynomial `0x1021`, initial value `0xFFFF`, no reflection, no
 final XOR. A receiver must search for the sync bytes again after a CRC or length
 error.
 
-## PC to MCU: sensor state (`type = 0x01`, 22-byte payload)
+## PC to MCU: sensor state (`type = 0x01`, 26-byte payload)
 
 Sent every 10 ms. Latitude and longitude hold the most recent GPS fix; bit 0 of
 `flags` is set for exactly one frame when the 1 Hz GPS model produces a new fix.
@@ -29,9 +29,10 @@ Sent every 10 ms. Latitude and longitude hold the most recent GPS fix; bit 0 of
 | 0 | uint32 | simulation_time | ms |
 | 4 | uint16 | flags | bit 0 = GPS_NEW |
 | 6 | float32 | yaw | rad, north=0, clockwise positive, range `[-pi, pi)` |
-| 10 | int32 | latitude | degrees x 1e-7 |
-| 14 | int32 | longitude | degrees x 1e-7 |
-| 18 | float32 | GPS accuracy radius | m, approximate 95% radius |
+| 10 | float32 | yaw rate | rad/s, clockwise positive |
+| 14 | int32 | latitude | degrees x 1e-7 |
+| 18 | int32 | longitude | degrees x 1e-7 |
+| 22 | float32 | GPS accuracy radius | m, approximate 95% radius |
 
 ## PC to MCU: target (`type = 0x02`, 16-byte payload)
 

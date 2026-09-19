@@ -26,9 +26,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(FrameParser().feed_motor_commands(frame), [])
 
     def test_sensor_uses_integer_e7_coordinates(self):
-        frame = encode_sensor(7, 10, True, 0.5, 30.1234567, 120.7654321, 1.5)
+        frame = encode_sensor(7, 10, True, 0.5, -0.25, 30.1234567, 120.7654321, 1.5)
         payload = frame[8:-2]
-        _, _, _, latitude_e7, longitude_e7, _ = SENSOR_PAYLOAD.unpack(payload)
+        _, _, _, yaw_rate, latitude_e7, longitude_e7, _ = SENSOR_PAYLOAD.unpack(payload)
+        self.assertAlmostEqual(yaw_rate, -0.25)
         self.assertEqual(latitude_e7, 301234567)
         self.assertEqual(longitude_e7, 1207654321)
 
