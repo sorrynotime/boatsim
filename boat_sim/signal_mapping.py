@@ -18,5 +18,10 @@ def map_motor_commands(
     return left, right
 
 
-def map_yaw_rate(yaw_rate_rps: float, *, invert: bool = False) -> float:
-    return -yaw_rate_rps if invert else yaw_rate_rps
+import math
+
+
+def map_yaw_angle(yaw_rad: float, *, invert: bool = False) -> float:
+    if not invert:
+        return yaw_rad
+    return (-yaw_rad + math.pi) % (2.0 * math.pi) - math.pi

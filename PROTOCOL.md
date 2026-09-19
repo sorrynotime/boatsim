@@ -35,9 +35,9 @@ Sent every 10 ms. Latitude and longitude hold the most recent GPS fix; bit 0 of
 | 18 | int32 | longitude | degrees x 1e-7 |
 | 22 | float32 | GPS accuracy radius | m, approximate 95% radius |
 
-The simulator's **Invert gyro yaw rate** option changes the sign of the
-`yaw rate` field only. It does not change the true trajectory or the `yaw`
-heading field.
+The simulator's **Invert gyro angle direction** option changes the sign of the
+`yaw` field only. It does not change the true trajectory or the `yaw rate`
+field.
 
 ## PC to MCU: target (`type = 0x02`, 16-byte payload)
 
@@ -67,8 +67,9 @@ frames.
 
 ## MCU to PC: EKF position (`type = 0x82`, 12-byte payload)
 
-Send this frame every 500 ms (2 Hz). A 1-second period (1 Hz) is also supported.
-It is deliberately separate from the real-time motor frame.
+The supported update range is 1-10 Hz. A 200 ms period (5 Hz) is recommended;
+100 ms (10 Hz), 500 ms (2 Hz), and 1 second (1 Hz) are also supported. It is
+deliberately separate from the real-time motor frame.
 
 | Payload offset | Type | Field | Unit |
 |---:|---|---|---|

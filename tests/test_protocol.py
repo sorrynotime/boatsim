@@ -37,6 +37,20 @@ class ProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(messages[0].ekf_latitude_deg, 30.1234567)
         self.assertAlmostEqual(messages[0].ekf_longitude_deg, 120.7654321)
 
+    def test_parser_accepts_burst_of_ten_hz_ekf_frames(self):
+        stream = b"".join(
+            encode_frame(
+                MSG_EKF_POSITION,
+                sequence,
+                EKF_POSITION_PAYLOAD.pack(sequence * 100, 300000000 + sequence, 1200000000),
+            )
+            for sequence in range(10)
+        )
+        messages = FrameParser().feed_messages(stream)
+        self.assertEqual(len(messages), 10)
+        self.assertTrue(all(isinstance(message, EkfPosition) for message in messages))
+        self.assertEqual(messages[-1].mcu_time_ms, 900)
+
     def test_sensor_uses_integer_e7_coordinates(self):
         frame = encode_sensor(7, 10, True, 0.5, -0.25, 30.1234567, 120.7654321, 1.5)
         payload = frame[8:-2]
