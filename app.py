@@ -13,7 +13,7 @@ from boat_sim.signal_mapping import map_motor_commands, map_yaw_angle
 
 
 SIM_DT = 0.01
-GPS_PERIOD_S = 1.0
+GPS_PERIOD_S = 0.2
 
 
 class BoatSimulatorApp:

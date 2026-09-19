@@ -19,7 +19,7 @@ Use that mode first to tune mass, thrust, maximum speed, yaw rate, and motor
 response. Disable it after connecting the MCU.
 
 Coordinates in the plot are local east/north metres. Yaw is zero at north and
-positive clockwise. GPS is generated at 1 Hz; yaw and serial sensor frames run
+positive clockwise. GPS is generated at 5 Hz; yaw and serial sensor frames run
 at 100 Hz. See [PROTOCOL.md](PROTOCOL.md) for the binary protocol.
 
 Click the map to select a target. The selected local coordinate is converted to
@@ -28,7 +28,7 @@ copied to the clipboard or sent to the MCU. The direction mapping controls can
 invert the yaw angle or either motor without changing the dynamics model. Motor
 channel swapping is enabled by default and can be disabled in the UI.
 
-The true simulated trajectory is blue, 1 Hz GPS samples are orange, and the
+The true simulated trajectory is blue, 5 Hz GPS samples are orange, and the
 EKF coordinates returned by the MCU are shown as a green trace. Motor commands
 remain at 100 Hz; EKF position uses a separate `0x82` frame at 1-10 Hz. A 5 Hz
 EKF update rate is recommended.
