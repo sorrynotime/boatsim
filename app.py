@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from boat_sim.model import BoatParameters, DifferentialBoat, GpsSensor, gps_to_local, local_to_gps
+from boat_sim.collision import CircleObstacle, PolygonObstacle, resolve_motion
 from boat_sim.protocol import encode_sensor, encode_target
 from boat_sim.route import MAX_WAYPOINTS, RoutePlan, Waypoint
 from boat_sim.serial_link import SerialLink
@@ -13,7 +14,8 @@ from boat_sim.signal_mapping import map_motor_commands, map_yaw_angle
 
 
 SIM_DT = 0.01
-GPS_PERIOD_S = 0.2
+GPS_DEFAULT_HZ = 5.0
+MAP_HALF_EXTENT_M = 40.0
 
 
 class BoatSimulatorApp:
@@ -26,12 +28,18 @@ class BoatSimulatorApp:
         self.gps = GpsSensor()
         self.link = SerialLink()
         self.route = RoutePlan()
+        self.obstacles: list[CircleObstacle | PolygonObstacle] = []
+        self.shoreline_draft: list[tuple[float, float]] = []
+        self.collision_mode_var = tk.StringVar(value="停止")
+        self.obstacle_mode_var = tk.StringVar(value="目标")
+        self.obstacle_radius_var = tk.DoubleVar(value=3.0)
+        self.collision_status = "无碰撞"
         self.running = False
         self.sim_time = 0.0
         self.accumulator = 0.0
         self.last_tick = time.perf_counter()
         self.last_draw = self.last_tick
-        self.last_gps_time = -GPS_PERIOD_S
+        self.last_gps_time = -self._gps_period_s()
         self.last_sensor_send = -SIM_DT
         self.sequence = 0
         self.latest_gps = (30.000000, 120.000000)
@@ -42,7 +50,7 @@ class BoatSimulatorApp:
         self.last_ekf_frame: tuple[int, int] | None = None
         self.arrival_since: float | None = None
         self.arrived = False
-        self.view_extent = 10.0
+        self.view_extent = MAP_HALF_EXTENT_M
         self.vars: dict[str, tk.Variable] = {}
         self._build_ui()
         self._refresh_ports()
@@ -82,12 +90,13 @@ class BoatSimulatorApp:
 
         params = ttk.LabelFrame(setup_tab, text="船体参数", padding=6)
         params.pack(fill="x")
-        self._entry(params, "质量 (kg)", "mass", 20.0)
-        self._entry(params, "电机间距 (m)", "spacing", 0.60)
-        self._entry(params, "最大速度 (m/s)", "max_speed", 3.0)
+        self._entry(params, "质量 (kg)", "mass", 5.0)
+        self._entry(params, "电机间距 (m)", "spacing", 0.15)
+        self._entry(params, "最大速度 (m/s)", "max_speed", 1.2)
         self._entry(params, "最大转向速度 (rad/s)", "max_yaw", 1.2)
         self._entry(params, "单电机最大推力 (N)", "max_thrust", 35.0)
         self._entry(params, "电机响应时间 (s)", "motor_tau", 0.25)
+        self._entry(params, "船体碰撞半径 (m)", "collision_radius", 0.80)
         ttk.Button(params, text="应用参数", command=self._apply_parameters).pack(fill="x", pady=(4, 0))
 
         location = ttk.LabelFrame(operation_tab, text="坐标与目标", padding=6)
@@ -98,6 +107,17 @@ class BoatSimulatorApp:
         self._entry(location, "目标北向 (m)", "target_north", 30.0)
         self._entry(location, "到达半径 (m)", "arrival_radius", 2.0)
         self._entry(location, "GPS 精度半径 (m)", "gps_accuracy", 1.5)
+        gps_row = ttk.Frame(location)
+        gps_row.pack(fill="x", pady=1)
+        ttk.Label(gps_row, text="GPS 更新频率 (Hz)", width=23).pack(side="left")
+        self.gps_rate_var = tk.StringVar(value=str(int(GPS_DEFAULT_HZ)))
+        ttk.Combobox(
+            gps_row,
+            textvariable=self.gps_rate_var,
+            values=("1", "5", "10"),
+            state="readonly",
+            width=9,
+        ).pack(side="right")
         target_actions = ttk.Frame(location)
         target_actions.pack(fill="x", pady=(4, 0))
         ttk.Button(target_actions, text="下发目标", command=self._send_target).pack(side="left", fill="x", expand=True)
@@ -109,6 +129,26 @@ class BoatSimulatorApp:
         motors.pack(fill="x", pady=(6, 0))
         self._scale(motors, "左", "manual_left")
         self._scale(motors, "右", "manual_right")
+
+        obstacles = ttk.LabelFrame(operation_tab, text="障碍物与岸线", padding=6)
+        obstacles.pack(fill="x", pady=(6, 0))
+        obstacle_mode_row = ttk.Frame(obstacles)
+        obstacle_mode_row.pack(fill="x", pady=1)
+        ttk.Label(obstacle_mode_row, text="地图点击模式", width=15).pack(side="left")
+        ttk.Combobox(obstacle_mode_row, textvariable=self.obstacle_mode_var,
+                     values=("目标", "石岛", "岸线"), state="readonly", width=9).pack(side="right")
+        obstacle_radius_row = ttk.Frame(obstacles)
+        obstacle_radius_row.pack(fill="x", pady=1)
+        ttk.Label(obstacle_radius_row, text="石岛半径 (m)", width=15).pack(side="left")
+        ttk.Entry(obstacle_radius_row, textvariable=self.obstacle_radius_var, width=11).pack(side="right")
+        ttk.Button(obstacles, text="完成岸线", command=self._finish_shoreline).pack(fill="x", pady=(3, 0))
+        ttk.Button(obstacles, text="删除最后障碍物", command=self._delete_last_obstacle).pack(fill="x", pady=(3, 0))
+        ttk.Button(obstacles, text="清空障碍物", command=self._clear_obstacles).pack(fill="x", pady=(3, 0))
+        collision_row = ttk.Frame(obstacles)
+        collision_row.pack(fill="x", pady=(3, 0))
+        ttk.Label(collision_row, text="碰撞响应", width=15).pack(side="left")
+        ttk.Combobox(collision_row, textvariable=self.collision_mode_var,
+                     values=("停止", "沿边滑行"), state="readonly", width=9).pack(side="right")
 
         mapping = ttk.LabelFrame(setup_tab, text="方向映射", padding=6)
         mapping.pack(fill="x", pady=(6, 0))
@@ -165,11 +205,20 @@ class BoatSimulatorApp:
     def _value(self, key: str) -> float:
         return float(self.vars[key].get())
 
+    def _gps_period_s(self) -> float:
+        try:
+            rate_hz = float(self.gps_rate_var.get())
+        except (AttributeError, tk.TclError, ValueError):
+            rate_hz = GPS_DEFAULT_HZ
+        return 1.0 / max(0.1, rate_hz)
+
     def _apply_parameters(self) -> None:
         try:
             values = [self._value(key) for key in ("mass", "spacing", "max_speed", "max_yaw", "max_thrust", "motor_tau")]
             if any(value <= 0 for value in values):
                 raise ValueError("参数必须全部大于 0")
+            if self._value("collision_radius") <= 0:
+                raise ValueError("船体碰撞半径必须大于 0")
             self.boat.parameters = BoatParameters(*values)
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("参数错误", str(exc))
@@ -209,7 +258,7 @@ class BoatSimulatorApp:
         self.boat.reset()
         self.sim_time = 0.0
         self.accumulator = 0.0
-        self.last_gps_time = -GPS_PERIOD_S
+        self.last_gps_time = -self._gps_period_s()
         self.last_sensor_send = -SIM_DT
         self.true_path.clear()
         self.gps_path.clear()
@@ -218,7 +267,7 @@ class BoatSimulatorApp:
         self.last_ekf_frame = None
         self.arrival_since = None
         self.arrived = False
-        self.view_extent = 10.0
+        self.view_extent = MAP_HALF_EXTENT_M
         self.vars["manual_left"].set(0)
         self.vars["manual_right"].set(0)
         self._draw()
@@ -256,17 +305,59 @@ class BoatSimulatorApp:
             messagebox.showerror("目标参数错误", str(exc))
 
     def _pick_target(self, event: tk.Event) -> None:
-        if self.route.running:
-            self.route_status_var.set("请先停止航线，再拾取或编辑航点")
-            return
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
         scale = getattr(self, "view_scale", 1.0)
         east = (event.x - width / 2) / scale
         north = (height / 2 - event.y) / scale
+        if self.obstacle_mode_var.get() == "石岛":
+            try:
+                radius = float(self.obstacle_radius_var.get())
+                if radius <= 0:
+                    raise ValueError("石岛半径必须大于 0")
+                self.obstacles.append(CircleObstacle(east, north, radius))
+                self.collision_status = f"已添加石岛 ({east:.1f}, {north:.1f})"
+                self._draw()
+            except (tk.TclError, ValueError) as exc:
+                messagebox.showerror("障碍物", str(exc))
+            return
+        if self.obstacle_mode_var.get() == "岸线":
+            self.shoreline_draft.append((east, north))
+            self.collision_status = f"岸线点 {len(self.shoreline_draft)}，继续点击或完成岸线"
+            self._draw()
+            return
+        if self.route.running:
+            self.route_status_var.set("请先停止航线，再拾取或编辑航点")
+            return
         self.vars["target_east"].set(round(east, 3))
         self.vars["target_north"].set(round(north, 3))
         self._update_picked_coordinate()
+        self._draw()
+
+    def _finish_shoreline(self) -> None:
+        if len(self.shoreline_draft) < 3:
+            messagebox.showinfo("岸线", "至少需要点击 3 个点")
+            return
+        self.obstacles.append(PolygonObstacle(tuple(self.shoreline_draft)))
+        self.shoreline_draft.clear()
+        self.collision_status = "已添加岸线禁行区域"
+        self._draw()
+
+    def _delete_last_obstacle(self) -> None:
+        if self.shoreline_draft:
+            self.shoreline_draft.pop()
+            self.collision_status = "已删除最后一个岸线点"
+        elif self.obstacles:
+            self.obstacles.pop()
+            self.collision_status = "已删除最后一个障碍物"
+        else:
+            self.collision_status = "没有可删除的障碍物"
+        self._draw()
+
+    def _clear_obstacles(self) -> None:
+        self.obstacles.clear()
+        self.shoreline_draft.clear()
+        self.collision_status = "障碍物已清空"
         self._draw()
 
     def _add_waypoint(self) -> None:
@@ -383,14 +474,41 @@ class BoatSimulatorApp:
 
     def _simulate_step(self) -> None:
         left, right, _ = self._motor_values()
+        previous_position = (self.boat.state.east_m, self.boat.state.north_m)
         self.boat.step(left, right, SIM_DT)
-        self.sim_time += SIM_DT
         state = self.boat.state
+        collision = resolve_motion(
+            previous_position,
+            (state.east_m, state.north_m),
+            self._value("collision_radius"),
+            self.obstacles,
+        )
+        if collision is not None:
+            state.east_m, state.north_m = collision.position
+            if self.collision_mode_var.get() == "沿边滑行":
+                velocity = (state.speed_mps * math.sin(state.yaw_rad), state.speed_mps * math.cos(state.yaw_rad))
+                normal_speed = velocity[0] * collision.normal[0] + velocity[1] * collision.normal[1]
+                tangent = (velocity[0] - normal_speed * collision.normal[0], velocity[1] - normal_speed * collision.normal[1])
+                tangent_speed = math.hypot(*tangent)
+                if tangent_speed > 1e-4:
+                    state.speed_mps = tangent_speed
+                    state.yaw_rad = math.atan2(tangent[0], tangent[1])
+                else:
+                    state.speed_mps = 0.0
+                state.yaw_rate_rps = 0.0
+            else:
+                state.speed_mps = 0.0
+                state.yaw_rate_rps = 0.0
+            self.collision_status = "碰撞：" + ("沿边滑行" if self.collision_mode_var.get() == "沿边滑行" else "已停止")
+        else:
+            self.collision_status = "无碰撞"
+        self.sim_time += SIM_DT
         if not self.true_path or math.dist(self.true_path[-1], (state.east_m, state.north_m)) >= 0.05:
             self.true_path.append((state.east_m, state.north_m))
             if len(self.true_path) > 50_000:
                 del self.true_path[:10_000]
-        gps_new = self.sim_time - self.last_gps_time >= GPS_PERIOD_S - 1e-9
+        gps_period_s = self._gps_period_s()
+        gps_new = self.sim_time - self.last_gps_time >= gps_period_s - 1e-9
         if gps_new:
             self.last_gps_time = self.sim_time
             self.latest_gps = self.gps.sample(state, self._value("lat0"), self._value("lon0"), self._value("gps_accuracy"))
@@ -444,9 +562,7 @@ class BoatSimulatorApp:
         canvas.delete("all")
         target = (self._value("target_east"), self._value("target_north"))
         route_points = [(point.east_m, point.north_m) for point in self.route.waypoints]
-        points = self.true_path + self.ekf_path + route_points + [(0.0, 0.0), target]
-        required_extent = max(10.0, *(abs(v) for point in points for v in point)) * 1.2
-        self.view_extent = max(self.view_extent, required_extent)
+        self.view_extent = MAP_HALF_EXTENT_M
         scale = min(width, height) / (2.0 * self.view_extent)
         self.view_scale = scale
 
@@ -460,6 +576,26 @@ class BoatSimulatorApp:
             _, y = xy(0, value)
             canvas.create_line(x, 0, x, height, fill="#e5e7eb")
             canvas.create_line(0, y, width, y, fill="#e5e7eb")
+        for obstacle in self.obstacles:
+            if isinstance(obstacle, CircleObstacle):
+                ox, oy = xy(obstacle.east_m, obstacle.north_m)
+                radius_px = obstacle.radius_m * scale
+                canvas.create_oval(ox - radius_px, oy - radius_px, ox + radius_px, oy + radius_px,
+                                   fill="#94a3b8", outline="#475569", width=2)
+                canvas.create_oval(ox - radius_px * 0.45, oy - radius_px * 0.25,
+                                   ox + radius_px * 0.20, oy + radius_px * 0.10,
+                                   fill="#cbd5e1", outline="")
+            else:
+                polygon = [xy(*point) for point in obstacle.points]
+                canvas.create_polygon(*(coord for point in polygon for coord in point),
+                                      fill="#64748b", outline="#334155", width=2, stipple="gray25")
+        if self.shoreline_draft:
+            draft = [xy(*point) for point in self.shoreline_draft]
+            if len(draft) >= 2:
+                canvas.create_line(*(coord for point in draft for coord in point), fill="#0f766e", width=2, dash=(5, 3))
+            for index, point in enumerate(draft):
+                canvas.create_oval(point[0] - 4, point[1] - 4, point[0] + 4, point[1] + 4, fill="#14b8a6", outline="")
+                canvas.create_text(point[0] + 7, point[1] - 7, text=str(index + 1), fill="#0f766e", anchor="sw")
         if len(self.true_path) >= 2:
             display_path = self._display_points(self.true_path)
             canvas.create_line(*(coord for point in display_path for coord in xy(*point)), fill="#2563eb", width=2)
@@ -488,13 +624,29 @@ class BoatSimulatorApp:
         canvas.create_line(tx, ty - 7, tx, ty + 7, fill="#16a34a", width=2)
         state = self.boat.state
         bx, by = xy(state.east_m, state.north_m)
-        bow_x = bx + math.sin(state.yaw_rad) * 18
-        bow_y = by - math.cos(state.yaw_rad) * 18
-        left_x = bx + math.sin(state.yaw_rad + 2.45) * 11
-        left_y = by - math.cos(state.yaw_rad + 2.45) * 11
-        right_x = bx + math.sin(state.yaw_rad - 2.45) * 11
-        right_y = by - math.cos(state.yaw_rad - 2.45) * 11
-        canvas.create_polygon(bow_x, bow_y, left_x, left_y, right_x, right_y, fill="#dc2626", outline="#7f1d1d")
+        forward = (math.sin(state.yaw_rad), -math.cos(state.yaw_rad))
+        right = (math.cos(state.yaw_rad), math.sin(state.yaw_rad))
+
+        def hull_point(forward_m: float, lateral_m: float) -> tuple[float, float]:
+            return (
+                bx + forward[0] * forward_m + right[0] * lateral_m,
+                by + forward[1] * forward_m + right[1] * lateral_m,
+            )
+
+        # A compact top-down hull: pointed bow, squared stern, deck and two props.
+        hull = [hull_point(23, 0), hull_point(10, -11), hull_point(-16, -10), hull_point(-19, 0),
+                hull_point(-16, 10), hull_point(10, 11)]
+        canvas.create_polygon(*(coord for point in hull for coord in point), fill="#0f4c81", outline="#082f49", width=2)
+        deck = [hull_point(10, 0), hull_point(4, -7), hull_point(-10, -7), hull_point(-13, 0),
+                hull_point(-10, 7), hull_point(4, 7)]
+        canvas.create_polygon(*(coord for point in deck for coord in point), fill="#38bdf8", outline="#0c4a6e")
+        cabin = [hull_point(6, -4.5), hull_point(1, -4.5), hull_point(-5, -3.5), hull_point(-5, 3.5),
+                 hull_point(1, 4.5), hull_point(6, 4.5)]
+        canvas.create_polygon(*(coord for point in cabin for coord in point), fill="#e0f2fe", outline="#075985")
+        for lateral in (-8, 8):
+            px, py = hull_point(-15, lateral)
+            canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#f59e0b", outline="#92400e")
+        canvas.create_line(bx, by, *hull_point(30, 0), fill="#f97316", width=2)
         distance = math.hypot(state.east_m - target[0], state.north_m - target[1])
         raw_left, raw_right, source = self._raw_motor_values()
         left, right, _ = self._motor_values()
@@ -514,7 +666,8 @@ class BoatSimulatorApp:
             f"GPS：{self.latest_gps[0]:.7f}, {self.latest_gps[1]:.7f}\n"
             f"EKF：{ekf_text}\n"
             f"电机帧：{self.link.stats.received_motor_frames}\n"
-            f"EKF 帧：{self.link.stats.received_ekf_frames}"
+            f"EKF 帧：{self.link.stats.received_ekf_frames}\n"
+            f"障碍物：{len(self.obstacles)} / {self.collision_status}"
         )
 
     def _close(self) -> None:

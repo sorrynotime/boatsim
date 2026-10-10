@@ -19,7 +19,7 @@ Use that mode first to tune mass, thrust, maximum speed, yaw rate, and motor
 response. Disable it after connecting the MCU.
 
 Coordinates in the plot are local east/north metres. Yaw is zero at north and
-positive clockwise. GPS is generated at 5 Hz; yaw and serial sensor frames run
+positive clockwise. GPS is selectable at 1/5/10 Hz (default 5 Hz); yaw and serial sensor frames run
 at 100 Hz. See [PROTOCOL.md](PROTOCOL.md) for the binary protocol.
 
 Click the map to select a target. The selected local coordinate is converted to
@@ -45,3 +45,13 @@ resetting the simulation does not erase the planned route.
 
 Arrival means the boat remains inside the configured target radius for two
 seconds. A 200 ms MCU command timeout stops both simulated motors.
+
+## Obstacles
+
+In the **Obstacles and shoreline** panel, choose **Stone island** and click the
+map to add circular obstacles. Choose **Shoreline**, click at least three
+points, then click **Finish shoreline** to create a polygon no-go area. The
+map keeps the last obstacle at the configured 80 m by 80 m view. Collision
+response can stop the boat or remove the velocity component into the obstacle
+so it slides along the boundary. These obstacles are PC-side simulation data
+and are not included in the serial protocol.

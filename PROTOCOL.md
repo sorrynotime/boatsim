@@ -23,9 +23,10 @@ error.
 ## PC to MCU: sensor state (`type = 0x01`, 26-byte payload)
 
 Sent every 10 ms. Latitude and longitude hold the most recent GPS fix; bit 0 of
-`flags` is set for exactly one frame when the 5 Hz GPS model produces a new fix.
-With the 100 Hz sensor-state stream, this means one `GPS_NEW` pulse every 20
-frames.
+`flags` is set for exactly one frame when the GPS model produces a new fix.
+The simulator provides selectable 1 Hz, 5 Hz, and 10 Hz rates. With the 100 Hz
+sensor-state stream, this means one `GPS_NEW` pulse every 100, 20, or 10
+frames respectively.
 
 | Payload offset | Type | Field | Unit |
 |---:|---|---|---|
