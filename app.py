@@ -42,6 +42,11 @@ class BoatSimulatorApp:
         self.link = SerialLink()
         self.route = RoutePlan()
         self.route_window: tk.Toplevel | None = None
+        # 测距: 世界坐标折点 + 闭合标记 + 橡皮筋光标; 纯地图标注, 不进串口协议
+        self.measure_points: list[tuple[float, float]] = []
+        self.measure_closed = False
+        self.measure_cursor: tuple[float, float] | None = None
+        self.measure_status_var = tk.StringVar(value="测距: 左键依次点选, 按钮清除")
         self.obstacles: list[CircleObstacle | PolygonObstacle] = []
         self.shoreline_draft: list[tuple[float, float]] = []
         self.collision_mode_var = tk.StringVar(value="沿边滑行")
@@ -181,12 +186,15 @@ class BoatSimulatorApp:
         obstacle_mode_row.pack(fill="x", pady=1)
         ttk.Label(obstacle_mode_row, text="地图点击模式", width=15).pack(side="left")
         self.obstacle_mode_buttons: dict[str, tk.Button] = {}
-        for mode in ("目标", "石岛", "岸线"):
+        for mode in ("目标", "石岛", "岸线", "测距"):
             button = tk.Button(obstacle_mode_row, text=mode, relief="raised", bd=2,
                                command=lambda m=mode: self._set_obstacle_mode(m))
             button.pack(side="left", fill="x", expand=True, padx=(0, 4))
             self.obstacle_mode_buttons[mode] = button
         self._refresh_obstacle_mode_buttons()
+        ttk.Label(obstacles, textvariable=self.measure_status_var, wraplength=220,
+                  justify="left").pack(fill="x", pady=(3, 0))
+        ttk.Button(obstacles, text="清除测距 (Esc)", command=self._clear_measure).pack(fill="x", pady=(3, 0))
         obstacle_radius_row = ttk.Frame(obstacles)
         obstacle_radius_row.pack(fill="x", pady=1)
         ttk.Label(obstacle_radius_row, text="石岛半径 (m)", width=15).pack(side="left")
@@ -268,6 +276,9 @@ class BoatSimulatorApp:
             ("<ButtonRelease-3>", self._on_pan_end),
         ):
             self.canvas.bind(sequence, handler)
+        self.canvas.bind("<Motion>", self._on_map_motion)
+        self.canvas.bind("<Leave>", self._on_map_leave)
+        self.canvas.bind("<Escape>", self._on_map_escape)
 
     def _entry(self, parent: ttk.Widget, label: str, key: str, default: float) -> None:
         row = ttk.Frame(parent)
@@ -445,6 +456,8 @@ class BoatSimulatorApp:
 
     def _set_obstacle_mode(self, mode: str) -> None:
         self.obstacle_mode_var.set(mode)
+        if mode != "测距":
+            self.measure_cursor = None  # 离开测距模式, 收起橡皮筋
         self._refresh_obstacle_mode_buttons()
 
     def _refresh_obstacle_mode_buttons(self) -> None:
@@ -478,6 +491,9 @@ class BoatSimulatorApp:
             self.shoreline_draft.append((east, north))
             self.collision_status = f"岸线点 {len(self.shoreline_draft)}，继续点击或完成岸线"
             self._draw()
+            return
+        if self.obstacle_mode_var.get() == "测距":
+            self._measure_click(east, north, event, width, height, scale)
             return
         if self.route.running:
             self.route_status_var.set("请先停止航线，再拾取或编辑航点")
@@ -566,6 +582,112 @@ class BoatSimulatorApp:
         self.shoreline_draft.clear()
         self.collision_status = "障碍物已清空"
         self._draw()
+
+    # ------------------------------------------------------------------
+    # 测距: 世界坐标折点 + 段长/方位角标注 + 橡皮筋预览; 与障碍物一样
+    # 只是 PC 端地图标注, 不改变串口协议。
+    # ------------------------------------------------------------------
+
+    def _measure_click(self, east: float, north: float, event: tk.Event,
+                       width: int, height: int, scale: float) -> None:
+        """测距模式左键: 追加折点; 已有 >=3 点时点在起点 6px 内视为闭合(测周长)。"""
+        if self.measure_closed:
+            self.measure_status_var.set("已闭合, 按 Esc 或\"清除测距\"后重新测")
+            return
+        if len(self.measure_points) >= 3:
+            first = self.measure_points[0]
+            fx = width / 2 + (first[0] - self.view_center[0]) * scale
+            fy = height / 2 - (first[1] - self.view_center[1]) * scale
+            if math.hypot(event.x - fx, event.y - fy) <= 6.0:
+                self.measure_closed = True
+                self.measure_cursor = None
+                self._refresh_measure_status()
+                self._draw()
+                return
+        self.measure_points.append((east, north))
+        self._refresh_measure_status()
+        self._draw()
+
+    def _measure_total(self) -> float:
+        points = self.measure_points
+        if len(points) < 2:
+            return 0.0
+        total = sum(math.dist(a, b) for a, b in zip(points, points[1:]))
+        if self.measure_closed:
+            total += math.dist(points[-1], points[0])
+        return total
+
+    def _refresh_measure_status(self) -> None:
+        count = len(self.measure_points)
+        if self.measure_closed:
+            self.measure_status_var.set(f"测距: 已闭合 {count} 点 · 周长 {self._measure_total():.1f} m")
+        elif count == 0:
+            self.measure_status_var.set("测距: 左键依次点选, 按钮清除")
+        elif count == 1:
+            self.measure_status_var.set("测距: 已放置起点, 继续左键点选")
+        else:
+            last = math.dist(self.measure_points[-2], self.measure_points[-1])
+            self.measure_status_var.set(
+                f"测距: {count} 点 · 末段 {last:.1f} m · 总长 {self._measure_total():.1f} m")
+
+    def _clear_measure(self) -> None:
+        self.measure_points.clear()
+        self.measure_closed = False
+        self.measure_cursor = None
+        self._refresh_measure_status()
+        self._draw()
+
+    def _on_map_motion(self, event: tk.Event) -> None:
+        """测距模式: 只记录光标世界坐标供橡皮筋使用; 不在这里重绘(交给 10Hz 常规重绘)。"""
+        if self.obstacle_mode_var.get() != "测距" or not self.measure_points or self.measure_closed:
+            self.measure_cursor = None
+            return
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        scale = getattr(self, "view_scale", 1.0)
+        self.measure_cursor = (self.view_center[0] + (event.x - width / 2) / scale,
+                               self.view_center[1] + (height / 2 - event.y) / scale)
+
+    def _on_map_leave(self, _event: tk.Event) -> None:
+        self.measure_cursor = None
+
+    def _on_map_escape(self, _event: tk.Event) -> None:
+        if self.measure_points or self.measure_closed:
+            self._clear_measure()
+
+    def _draw_segment_label(self, canvas: tk.Canvas, s1: tuple[float, float],
+                            s2: tuple[float, float], p1: tuple[float, float],
+                            p2: tuple[float, float], live: bool = False) -> None:
+        """段中点标注: 长度 + 方位角(北为零, 顺时针, 三位度号, 航海习惯)。"""
+        length = math.dist(p1, p2)
+        bearing = math.degrees(math.atan2(p2[0] - p1[0], p2[1] - p1[1])) % 360.0
+        canvas.create_text((s1[0] + s2[0]) / 2, (s1[1] + s2[1]) / 2 - 9,
+                           text=f"{length:.1f} m {bearing:03.0f}°",
+                           fill="#075985" if live else "#0369a1",
+                           font=("TkDefaultFont", 9))
+
+    def _draw_measure(self, canvas: tk.Canvas, xy) -> None:
+        """测距标注: 已确认折线(青蓝实线+段长) + 橡皮筋(浅蓝虚线+实时长度)。"""
+        points = self.measure_points
+        screen = [xy(*point) for point in points]
+        for index in range(len(screen) - 1):
+            canvas.create_line(*screen[index], *screen[index + 1], fill="#0ea5e9", width=2)
+            self._draw_segment_label(canvas, screen[index], screen[index + 1],
+                                     points[index], points[index + 1])
+        if self.measure_closed and len(screen) >= 3:
+            canvas.create_line(*screen[-1], *screen[0], fill="#0ea5e9", width=2)
+            self._draw_segment_label(canvas, screen[-1], screen[0], points[-1], points[0])
+        if self.measure_cursor is not None and not self.measure_closed:
+            x, y = xy(*self.measure_cursor)
+            canvas.create_line(*screen[-1], x, y, fill="#7dd3fc", width=2, dash=(4, 3))
+            self._draw_segment_label(canvas, screen[-1], (x, y),
+                                     points[-1], self.measure_cursor, live=True)
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#7dd3fc", outline="")
+        for index, (x, y) in enumerate(screen):
+            radius = 5 if index == 0 else 4
+            canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                               fill="#0ea5e9", outline="#075985", width=1)
+            canvas.create_text(x + 8, y - 8, text=str(index + 1), fill="#0369a1", anchor="sw")
 
     def _build_route_window(self) -> None:
         """航线规划独立窗口: 平时 withdraw 隐藏, 由"航线规划…"按钮弹出;
@@ -1115,6 +1237,8 @@ class BoatSimulatorApp:
             radius = 7 if active else 5
             canvas.create_oval(wx - radius, wy - radius, wx + radius, wy + radius, fill=color, outline="")
             canvas.create_text(wx + 9, wy - 9, text=str(index + 1), fill=color, anchor="sw")
+        if self.measure_points:
+            self._draw_measure(canvas, xy)
         tx, ty = xy(*target)
         radius_px = max(3, self._value("arrival_radius") * scale)
         canvas.create_oval(tx - radius_px, ty - radius_px, tx + radius_px, ty + radius_px, outline="#16a34a", width=2)

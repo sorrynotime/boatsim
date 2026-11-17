@@ -57,6 +57,18 @@ resetting the simulation does not erase the planned route.
 Arrival means the boat remains inside the configured target radius for two
 seconds. A 200 ms MCU command timeout stops both simulated motors.
 
+## Distance measure
+
+Pick **Measure** in the map click mode row (active mode is green), then
+left-click the map point by point: every segment is labelled with its length
+and bearing (north-zero, clockwise, three-digit degrees) and the status line
+shows the last segment and the running total. While the measure mode is
+active a dashed rubber band follows the cursor with a live length. Clicking
+within a few pixels of the first point (from the third point on) closes the
+loop and reports the perimeter. Clear with the **Clear measure** button or
+`Esc`. Measured points are world coordinates, so panning and zooming keep
+them in place; they are PC-side map annotations only.
+
 ## Obstacles
 
 In the **Obstacles and shoreline** panel, the map click mode is a row of three
