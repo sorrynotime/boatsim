@@ -41,6 +41,7 @@ class BoatSimulatorApp:
         self.gps = GpsSensor()
         self.link = SerialLink()
         self.route = RoutePlan()
+        self.route_window: tk.Toplevel | None = None
         self.obstacles: list[CircleObstacle | PolygonObstacle] = []
         self.shoreline_draft: list[tuple[float, float]] = []
         self.collision_mode_var = tk.StringVar(value="沿边滑行")
@@ -172,6 +173,7 @@ class BoatSimulatorApp:
         motors.pack(fill="x", pady=(6, 0))
         self._scale(motors, "左", "manual_left")
         self._scale(motors, "右", "manual_right")
+        ttk.Button(motors, text="航线规划…(独立窗口)", command=self._open_route_window).pack(fill="x", pady=(6, 0))
 
         obstacles = ttk.LabelFrame(operation_tab, text="障碍物与岸线", padding=6)
         obstacles.pack(fill="x", pady=(6, 0))
@@ -248,21 +250,7 @@ class BoatSimulatorApp:
         self.telemetry_var = tk.StringVar()
         ttk.Label(controls, textvariable=self.telemetry_var, justify="left").pack(fill="x", pady=(6, 0))
 
-        route_panel = ttk.LabelFrame(plot_frame, text=f"航线规划 (最多 {MAX_WAYPOINTS} 点)", padding=8)
-        route_panel.pack(side="left", fill="y", padx=(0, 8))
-        self.route_list = tk.Listbox(route_panel, width=30, height=16, exportselection=False)
-        self.route_list.pack(fill="both", expand=True)
-        ttk.Button(route_panel, text="加入当前拾取点", command=self._add_waypoint).pack(fill="x", pady=(6, 0))
-        route_edit_actions = ttk.Frame(route_panel)
-        route_edit_actions.pack(fill="x", pady=(6, 0))
-        ttk.Button(route_edit_actions, text="删除", command=self._delete_waypoint).pack(side="left", fill="x", expand=True)
-        ttk.Button(route_edit_actions, text="清空", command=self._clear_route).pack(side="left", fill="x", expand=True, padx=(6, 0))
-        route_run_actions = ttk.Frame(route_panel)
-        route_run_actions.pack(fill="x", pady=(6, 0))
-        ttk.Button(route_run_actions, text="开始航线", command=self._start_route).pack(side="left", fill="x", expand=True)
-        ttk.Button(route_run_actions, text="停止", command=self._stop_route).pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self.route_status_var = tk.StringVar(value="航线未启动")
-        ttk.Label(route_panel, textvariable=self.route_status_var, wraplength=200).pack(fill="x", pady=(8, 0))
+        self._build_route_window()
 
         self.canvas = tk.Canvas(plot_frame, background="#f7fafc", highlightthickness=1, highlightbackground="#9ca3af")
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -578,6 +566,37 @@ class BoatSimulatorApp:
         self.shoreline_draft.clear()
         self.collision_status = "障碍物已清空"
         self._draw()
+
+    def _build_route_window(self) -> None:
+        """航线规划独立窗口: 平时 withdraw 隐藏, 由"航线规划…"按钮弹出;
+        点窗口的 X 只是隐藏(不销毁), 航线状态保留, 可随时再打开。"""
+        window = tk.Toplevel(self.root)
+        window.title("航线规划")
+        window.geometry("340x520")
+        window.protocol("WM_DELETE_WINDOW", window.withdraw)
+        self.route_window = window
+        panel = ttk.LabelFrame(window, text=f"航线规划 (最多 {MAX_WAYPOINTS} 点)", padding=8)
+        panel.pack(fill="both", expand=True, padx=8, pady=8)
+        self.route_list = tk.Listbox(panel, width=30, height=16, exportselection=False)
+        self.route_list.pack(fill="both", expand=True)
+        ttk.Button(panel, text="加入当前拾取点", command=self._add_waypoint).pack(fill="x", pady=(6, 0))
+        route_edit_actions = ttk.Frame(panel)
+        route_edit_actions.pack(fill="x", pady=(6, 0))
+        ttk.Button(route_edit_actions, text="删除", command=self._delete_waypoint).pack(side="left", fill="x", expand=True)
+        ttk.Button(route_edit_actions, text="清空", command=self._clear_route).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        route_run_actions = ttk.Frame(panel)
+        route_run_actions.pack(fill="x", pady=(6, 0))
+        ttk.Button(route_run_actions, text="开始航线", command=self._start_route).pack(side="left", fill="x", expand=True)
+        ttk.Button(route_run_actions, text="停止", command=self._stop_route).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.route_status_var = tk.StringVar(value="航线未启动")
+        ttk.Label(panel, textvariable=self.route_status_var, wraplength=200).pack(fill="x", pady=(8, 0))
+        window.withdraw()  # 平时不显示
+
+    def _open_route_window(self) -> None:
+        if self.route_window is None or not self.route_window.winfo_exists():
+            self._build_route_window()
+        self.route_window.deiconify()
+        self.route_window.lift()
 
     def _add_waypoint(self) -> None:
         try:

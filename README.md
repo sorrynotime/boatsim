@@ -43,7 +43,10 @@ at the 80 m view. Zoom with the mouse wheel as before.
 
 ## Route planning
 
-Click the map and add the selected position to the route. A route supports up
+The route planner is a separate window, hidden until you open it with the
+**Route plan…** button below the manual motor scales; closing it with the X only
+hides it and keeps the plan. Click the map and add the selected position to the
+route. A route supports up
 to 20 ordered waypoints. Starting the route sends waypoint 1 using the existing
 target frame. As soon as one EKF position is within the configured arrival
 radius, the PC treats that waypoint as reached and automatically sends the next
