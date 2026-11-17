@@ -112,7 +112,7 @@ class BoatSimulatorApp:
         ttk.Button(toolbar, text="刷新", command=self._refresh_ports).pack(side="left")
         self.connect_button = ttk.Button(toolbar, text="连接", command=self._toggle_connection)
         self.connect_button.pack(side="left", padx=(4, 12))
-        self.manual_mode = tk.BooleanVar(value=True)
+        self.manual_mode = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="本地手动电机", variable=self.manual_mode).pack(side="left")
         self.view_var = tk.StringVar(value="视野 40m")
         ttk.Label(toolbar, textvariable=self.view_var).pack(side="left", padx=(12, 0))

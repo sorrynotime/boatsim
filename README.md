@@ -15,8 +15,8 @@ python app.py
 ```
 
 The application also works without `pyserial` in **Local manual motor** mode.
-Use that mode first to tune mass, thrust, maximum speed, yaw rate, and motor
-response. Disable it after connecting the MCU.
+It is off by default; tick it to tune mass, thrust, maximum speed, yaw rate, and
+motor response without an MCU. Disable it after connecting the MCU.
 
 Coordinates in the plot are local east/north metres. Yaw is zero at north and
 positive clockwise. GPS is selectable at 1/5/10 Hz (default 5 Hz); yaw and serial sensor frames run
