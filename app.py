@@ -255,10 +255,17 @@ class BoatSimulatorApp:
         ttk.Label(survey_tab, textvariable=self.survey_status_var,
                   wraplength=220, justify="left").pack(fill="x", pady=(6, 0))
 
-        self.telemetry_var = tk.StringVar()
-        ttk.Label(controls, textvariable=self.telemetry_var, justify="left").pack(fill="x", pady=(6, 0))
-
         self._build_route_window()
+
+        # 遥测栏: 放在地图下方, 横向两行排布(先前在左侧窄栏里, 内容多被整段藏住)
+        telemetry_bar = ttk.Frame(plot_frame, padding=(6, 3))
+        telemetry_bar.pack(side="bottom", fill="x")
+        self.telemetry_row1_var = tk.StringVar()
+        self.telemetry_row2_var = tk.StringVar()
+        ttk.Label(telemetry_bar, textvariable=self.telemetry_row1_var, anchor="w",
+                  font=("TkDefaultFont", 9)).pack(fill="x")
+        ttk.Label(telemetry_bar, textvariable=self.telemetry_row2_var, anchor="w",
+                  font=("TkDefaultFont", 9)).pack(fill="x")
 
         self.canvas = tk.Canvas(plot_frame, background="#f7fafc", highlightthickness=1, highlightbackground="#9ca3af")
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -1304,21 +1311,21 @@ class BoatSimulatorApp:
             sonar_text = "-- / --"
         else:
             left_m, right_m, hit = self.last_sonar_text
-            sonar_text = (f"{left_m:.2f}{'*' if hit & 1 else ''} / "
-                          f"{right_m:.2f}{'*' if hit & 2 else ''} m (*=有回波)")
+            sonar_text = (f"{left_m:.1f}{'*' if hit & 1 else ''}/"
+                          f"{right_m:.1f}{'*' if hit & 2 else ''} m")
         self.status_var.set(f"{link_state} / {run_state}{arrived}")
-        self.telemetry_var.set(
-            f"输入：{source}\n原始左/右：{raw_left} / {raw_right}\n仿真左/右：{left} / {right}\n"
-            f"东/北：{state.east_m:.2f} / {state.north_m:.2f} m\n"
-            f"航向：{state.yaw_rad:.3f} rad\n速度：{state.speed_mps:.2f} m/s\n"
-            f"角速度：{state.yaw_rate_rps:.2f} rad/s\n目标距离：{distance:.2f} m\n"
-            f"GPS：{self.latest_gps[0]:.7f}, {self.latest_gps[1]:.7f}\n"
-            f"EKF：{ekf_text}\n"
-            f"声呐 左/右：{sonar_text}\n"
-            f"电机帧：{self.link.stats.received_motor_frames}\n"
-            f"EKF 帧：{self.link.stats.received_ekf_frames}\n"
-            f"回波点：{len(self.sonar_points)}\n"
-            f"障碍物：{len(self.obstacles)} / {self.collision_status}"
+        # 遥测栏两行: 上行=控制与运动, 下行=传感器与链路; * = 该通道有回波
+        self.telemetry_row1_var.set(
+            f"输入 {source} · 原始 {raw_left}/{raw_right} · 仿真 {left}/{right} · "
+            f"东/北 {state.east_m:.1f}/{state.north_m:.1f} m · 航向 {state.yaw_rad:.2f} rad · "
+            f"速度 {state.speed_mps:.2f} m/s · 角速度 {state.yaw_rate_rps:.2f} rad/s · "
+            f"目标距离 {distance:.1f} m"
+        )
+        self.telemetry_row2_var.set(
+            f"GPS {self.latest_gps[0]:.7f}, {self.latest_gps[1]:.7f} · EKF {ekf_text} · "
+            f"声呐 {sonar_text} · 电机帧 {self.link.stats.received_motor_frames} · "
+            f"EKF 帧 {self.link.stats.received_ekf_frames} · 回波点 {len(self.sonar_points)} · "
+            f"障碍物 {len(self.obstacles)} / {self.collision_status}"
         )
 
     def _close(self) -> None:
