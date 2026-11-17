@@ -33,6 +33,14 @@ EKF coordinates returned by the MCU are shown as a green trace. Motor commands
 remain at 100 Hz; EKF position uses a separate `0x82` frame at 1-10 Hz. A 5 Hz
 EKF update rate is recommended.
 
+## Camera
+
+The map starts centred on the local origin. Pan the camera by dragging with the
+middle or right mouse button (left click keeps picking targets and obstacles).
+Enable **Follow boat** in the toolbar to lock the camera on the hull; dragging
+the map or pressing **Reset view** leaves follow mode and returns to the origin
+at the 80 m view. Zoom with the mouse wheel as before.
+
 ## Route planning
 
 Click the map and add the selected position to the route. A route supports up
@@ -48,9 +56,15 @@ seconds. A 200 ms MCU command timeout stops both simulated motors.
 
 ## Obstacles
 
-In the **Obstacles and shoreline** panel, choose **Stone island** and click the
-map to add circular obstacles. Choose **Shoreline**, click at least three
-points, then click **Finish shoreline** to create a polygon no-go area. The
+In the **Obstacles and shoreline** panel, the map click mode is a row of three
+buttons (**Target** / **Stone island** / **Shoreline**); the active mode is
+highlighted green. **Generate default shore** drops a random wavy shoreline
+across the lower half of the current view and places the boat 0.5-1 m off the
+shore, facing open water; clicking it again replaces the previous shore.
+Collision response defaults to **Slide along edge** and can be switched to full
+stop. Choose **Stone island** and click the map to add circular obstacles.
+Choose **Shoreline**, click at least three points, then click **Finish
+shoreline** to create a polygon no-go area. The
 map keeps the last obstacle at the configured 80 m by 80 m view. Collision
 response can stop the boat or remove the velocity component into the obstacle
 so it slides along the boundary. These obstacles are PC-side simulation data

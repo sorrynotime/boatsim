@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -42,9 +43,10 @@ class BoatSimulatorApp:
         self.route = RoutePlan()
         self.obstacles: list[CircleObstacle | PolygonObstacle] = []
         self.shoreline_draft: list[tuple[float, float]] = []
-        self.collision_mode_var = tk.StringVar(value="停止")
+        self.collision_mode_var = tk.StringVar(value="沿边滑行")
         self.obstacle_mode_var = tk.StringVar(value="目标")
         self.obstacle_radius_var = tk.DoubleVar(value=3.0)
+        self.default_shore: PolygonObstacle | None = None  # "生成默认岸边"的成果; 重复生成时替换
         self.collision_status = "无碰撞"
         self.running = False
         self.sim_time = 0.0
@@ -81,6 +83,11 @@ class BoatSimulatorApp:
         self.arrival_since: float | None = None
         self.arrived = False
         self.view_extent = MAP_HALF_EXTENT_M
+        # 镜头状态: view_center 为镜头中心的世界坐标(东/北 m), 默认看向原点;
+        # follow_boat 开启时每帧把镜头中心对准船体, 拖拽平移会自动退出跟随。
+        self.view_center = [0.0, 0.0]
+        self.follow_boat = tk.BooleanVar(value=False)
+        self._pan_drag: tuple[float, float, float, float] | None = None
         self.vars: dict[str, tk.Variable] = {}
         self._build_ui()
         self._refresh_ports()
@@ -104,6 +111,7 @@ class BoatSimulatorApp:
         self.view_var = tk.StringVar(value="视野 40m")
         ttk.Label(toolbar, textvariable=self.view_var).pack(side="left", padx=(12, 0))
         ttk.Button(toolbar, text="视野复位", command=self._reset_view).pack(side="left", padx=(4, 0))
+        ttk.Checkbutton(toolbar, text="镜头跟随船体", variable=self.follow_boat).pack(side="left", padx=(8, 0))
         self.status_var = tk.StringVar(value="未连接 / 已停止")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="right")
 
@@ -170,12 +178,18 @@ class BoatSimulatorApp:
         obstacle_mode_row = ttk.Frame(obstacles)
         obstacle_mode_row.pack(fill="x", pady=1)
         ttk.Label(obstacle_mode_row, text="地图点击模式", width=15).pack(side="left")
-        ttk.Combobox(obstacle_mode_row, textvariable=self.obstacle_mode_var,
-                     values=("目标", "石岛", "岸线"), state="readonly", width=9).pack(side="right")
+        self.obstacle_mode_buttons: dict[str, tk.Button] = {}
+        for mode in ("目标", "石岛", "岸线"):
+            button = tk.Button(obstacle_mode_row, text=mode, relief="raised", bd=2,
+                               command=lambda m=mode: self._set_obstacle_mode(m))
+            button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+            self.obstacle_mode_buttons[mode] = button
+        self._refresh_obstacle_mode_buttons()
         obstacle_radius_row = ttk.Frame(obstacles)
         obstacle_radius_row.pack(fill="x", pady=1)
         ttk.Label(obstacle_radius_row, text="石岛半径 (m)", width=15).pack(side="left")
         ttk.Entry(obstacle_radius_row, textvariable=self.obstacle_radius_var, width=11).pack(side="right")
+        ttk.Button(obstacles, text="生成默认岸边", command=self._generate_default_shore).pack(fill="x", pady=(3, 0))
         ttk.Button(obstacles, text="完成岸线", command=self._finish_shoreline).pack(fill="x", pady=(3, 0))
         ttk.Button(obstacles, text="删除最后障碍物", command=self._delete_last_obstacle).pack(fill="x", pady=(3, 0))
         ttk.Button(obstacles, text="清空障碍物", command=self._clear_obstacles).pack(fill="x", pady=(3, 0))
@@ -256,6 +270,16 @@ class BoatSimulatorApp:
         self.canvas.bind("<Button-1>", self._pick_target)
         self.canvas.bind("<MouseWheel>", self._on_map_wheel)
         self.canvas.bind("<Double-Button-1>", lambda _event: self._reset_view())
+        # 镜头平移: 中键或右键拖拽(左键保留给拾取目标/障碍物)
+        for sequence, handler in (
+            ("<ButtonPress-2>", self._on_pan_start),
+            ("<B2-Motion>", self._on_pan_move),
+            ("<ButtonRelease-2>", self._on_pan_end),
+            ("<ButtonPress-3>", self._on_pan_start),
+            ("<B3-Motion>", self._on_pan_move),
+            ("<ButtonRelease-3>", self._on_pan_end),
+        ):
+            self.canvas.bind(sequence, handler)
 
     def _entry(self, parent: ttk.Widget, label: str, key: str, default: float) -> None:
         row = ttk.Frame(parent)
@@ -282,6 +306,9 @@ class BoatSimulatorApp:
 
     def _reset_view(self) -> None:
         self.view_extent = MAP_HALF_EXTENT_M
+        self.view_center[0] = 0.0
+        self.view_center[1] = 0.0
+        self.follow_boat.set(False)
         self.view_var.set("视野 40m")
         # 不直接 _draw: 让 10Hz 的常规重绘接手, 避免连续操作触发重绘风暴饿死仿真循环
 
@@ -294,6 +321,26 @@ class BoatSimulatorApp:
         factor = 1.15 ** (event.delta / 120.0)
         self.view_extent = max(self.MAP_MIN_EXTENT_M, min(self.MAP_MAX_EXTENT_M, self.view_extent / factor))
         self.view_var.set(f"视野 {self.view_extent:.0f}m")
+
+    def _on_pan_start(self, event: tk.Event) -> None:
+        """中键/右键按下: 记录拖拽起点(屏幕 x/y + 当时镜头中心), 并退出跟随模式。"""
+        if self.follow_boat.get():
+            self.follow_boat.set(False)
+        self._pan_drag = (event.x, event.y, self.view_center[0], self.view_center[1])
+        self.canvas.configure(cursor="fleur")
+
+    def _on_pan_move(self, event: tk.Event) -> None:
+        drag = self._pan_drag
+        if drag is None:
+            return
+        scale = max(1e-6, getattr(self, "view_scale", 1.0))
+        # 屏幕右移 = 镜头中心西移(世界东向减小); 屏幕下移 = 镜头中心南移
+        self.view_center[0] = drag[2] - (event.x - drag[0]) / scale
+        self.view_center[1] = drag[3] + (event.y - drag[1]) / scale
+
+    def _on_pan_end(self, _event: tk.Event) -> None:
+        self._pan_drag = None
+        self.canvas.configure(cursor="")
 
     def _gps_period_s(self) -> float:
         try:
@@ -364,6 +411,8 @@ class BoatSimulatorApp:
         self.last_sonar_text = None
         self.sonar_points = []
         self.view_extent = MAP_HALF_EXTENT_M
+        self.view_center[0] = 0.0
+        self.view_center[1] = 0.0
         if hasattr(self, "view_var"):
             self.view_var.set("视野 40m")
         self.vars["manual_left"].set(0)
@@ -402,12 +451,30 @@ class BoatSimulatorApp:
         except (tk.TclError, ValueError) as exc:
             messagebox.showerror("目标参数错误", str(exc))
 
+    # 地图点击模式按钮配色: 激活=绿, 未激活=灰
+    OBSTACLE_MODE_ACTIVE_BG = "#16a34a"
+    OBSTACLE_MODE_INACTIVE_BG = "#d1d5db"
+
+    def _set_obstacle_mode(self, mode: str) -> None:
+        self.obstacle_mode_var.set(mode)
+        self._refresh_obstacle_mode_buttons()
+
+    def _refresh_obstacle_mode_buttons(self) -> None:
+        active = self.obstacle_mode_var.get()
+        for mode, button in self.obstacle_mode_buttons.items():
+            if mode == active:
+                button.configure(bg=self.OBSTACLE_MODE_ACTIVE_BG, fg="#ffffff", relief="sunken",
+                                 activebackground="#15803d", activeforeground="#ffffff")
+            else:
+                button.configure(bg=self.OBSTACLE_MODE_INACTIVE_BG, fg="#374151", relief="raised",
+                                 activebackground="#9ca3af", activeforeground="#111827")
+
     def _pick_target(self, event: tk.Event) -> None:
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
         scale = getattr(self, "view_scale", 1.0)
-        east = (event.x - width / 2) / scale
-        north = (height / 2 - event.y) / scale
+        east = self.view_center[0] + (event.x - width / 2) / scale
+        north = self.view_center[1] + (height / 2 - event.y) / scale
         if self.obstacle_mode_var.get() == "石岛":
             try:
                 radius = float(self.obstacle_radius_var.get())
@@ -432,6 +499,58 @@ class BoatSimulatorApp:
         self._update_picked_coordinate()
         self._draw()
 
+    def _generate_default_shore(self) -> None:
+        """一键生成默认岸边: 位于当前视图最下半部分、横向伸出视野的微波浪岸线;
+        船放到岸线法线方向 0.5~1m 处(北/水面侧), 船头朝北。重复点击替换上一条。"""
+        extent = self.view_extent
+        center_east, center_north = self.view_center
+        span = extent * 1.3                       # 岸线横向伸出视野, 看不到尽头
+        depth = max(6.0, extent * 0.35)           # 陆地厚度, 伸到视野下方之外
+        base_north = center_north - extent * random.uniform(0.5, 0.65)
+        amplitude = random.uniform(0.5, 1.0)
+        wavelength = extent * random.uniform(1.2, 2.0)
+        phase = random.uniform(0.0, 2.0 * math.pi)
+        count = 12
+
+        def shore_north_at(east: float) -> float:
+            return base_north + amplitude * math.sin(2.0 * math.pi * east / wavelength + phase)
+
+        top = [(-span + 2.0 * span * index / count,
+                shore_north_at(-span + 2.0 * span * index / count)) for index in range(count + 1)]
+        shore = PolygonObstacle(tuple(top + [(span, base_north - depth), (-span, base_north - depth)]))
+        if self.default_shore is not None and self.default_shore in self.obstacles:
+            self.obstacles.remove(self.default_shore)
+        self.default_shore = shore
+        self.obstacles.append(shore)
+
+        # 船位: 按真实折线几何(而非解析曲线)放, 保证到岸边的距离精确
+        gap = random.uniform(0.5, 1.0)
+        boat_east = center_east + random.uniform(-0.15, 0.15) * extent
+        p1, p2 = next((a, b) for a, b in zip(top, top[1:]) if a[0] <= boat_east <= b[0])
+        ratio = (boat_east - p1[0]) / (p2[0] - p1[0])
+        shore_east, shore_north = boat_east, p1[1] + ratio * (p2[1] - p1[1])
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        length = math.hypot(dx, dy) or 1.0
+        normal_x, normal_y = -dy / length, dx / length
+        if normal_y < 0.0:
+            normal_x, normal_y = -normal_x, -normal_y  # 法线指向北(水面一侧)
+        self.boat.state.east_m = shore_east + normal_x * gap
+        self.boat.state.north_m = shore_north + normal_y * gap
+        self.boat.state.yaw_rad = 0.0
+        self.boat.state.speed_mps = 0.0
+        self.boat.state.yaw_rate_rps = 0.0
+        self.boat.left_actual = 0.0
+        self.boat.right_actual = 0.0
+        # 传送后清掉旧轨迹, 免得旧位置到新位置之间出现跨图长线段
+        self.true_path.clear()
+        self.gps_path.clear()
+        self.ekf_path.clear()
+        self.latest_ekf_gps = None
+        self.last_ekf_frame = None
+        self.sonar_points.clear()
+        self.collision_status = f"已生成默认岸边, 船在岸上 {gap:.2f} m 处"
+        self._draw()
+
     def _finish_shoreline(self) -> None:
         if len(self.shoreline_draft) < 3:
             messagebox.showinfo("岸线", "至少需要点击 3 个点")
@@ -446,7 +565,8 @@ class BoatSimulatorApp:
             self.shoreline_draft.pop()
             self.collision_status = "已删除最后一个岸线点"
         elif self.obstacles:
-            self.obstacles.pop()
+            if self.obstacles.pop() is self.default_shore:
+                self.default_shore = None
             self.collision_status = "已删除最后一个障碍物"
         else:
             self.collision_status = "没有可删除的障碍物"
@@ -454,6 +574,7 @@ class BoatSimulatorApp:
 
     def _clear_obstacles(self) -> None:
         self.obstacles.clear()
+        self.default_shore = None
         self.shoreline_draft.clear()
         self.collision_status = "障碍物已清空"
         self._draw()
@@ -567,8 +688,8 @@ class BoatSimulatorApp:
         self._update_route_progress(*point)
         if not self.ekf_path or math.dist(self.ekf_path[-1], point) >= 0.03:
             self.ekf_path.append(point)
-            if len(self.ekf_path) > 20_000:
-                del self.ekf_path[:4_000]
+            if len(self.ekf_path) > 9_000:   # 5Hz ≈ 30 分钟历史
+                del self.ekf_path[:3_000]
 
     # ------------------------------------------------------------------
     # 导航扩展: 会话建立 / CONFIG / RANGE 已在 _simulate_step; 此处是
@@ -769,14 +890,16 @@ class BoatSimulatorApp:
         self.sim_time += SIM_DT
         if not self.true_path or math.dist(self.true_path[-1], (state.east_m, state.north_m)) >= 0.05:
             self.true_path.append((state.east_m, state.north_m))
-            if len(self.true_path) > 50_000:
-                del self.true_path[:10_000]
+            if len(self.true_path) > 18_000:  # 10Hz ≈ 30 分钟历史
+                del self.true_path[:6_000]
         gps_period_s = self._gps_period_s()
         gps_new = self.sim_time - self.last_gps_time >= gps_period_s - 1e-9
         if gps_new:
             self.last_gps_time = self.sim_time
             self.latest_gps = self.gps.sample(state, self._value("lat0"), self._value("lon0"), self._value("gps_accuracy"))
             self.gps_path.append(gps_to_local(*self.latest_gps, self._value("lat0"), self._value("lon0")))
+            if len(self.gps_path) > 9_000:   # 5Hz ≈ 30 分钟; 补上上限, 消除唯一无界增长
+                del self.gps_path[:3_000]
         if self.sim_time - self.last_sensor_send >= SIM_DT - 1e-9:
             self.last_sensor_send = self.sim_time
             frame = encode_sensor(
@@ -806,8 +929,8 @@ class BoatSimulatorApp:
                     # 回波端点入点云: 船边扫过的障碍表面会逐渐连成轮廓
                     if not self.sonar_points or math.dist(self.sonar_points[-1], end) >= 0.05:
                         self.sonar_points.append(end)
-                        if len(self.sonar_points) > 6000:
-                            del self.sonar_points[:2000]
+                        if len(self.sonar_points) > 18_000:  # 10Hz ≈ 30 分钟回波
+                            del self.sonar_points[:6_000]
             self.last_sonar_beams = beams
             frame = encode_range(
                 self.sequence, self.nav_session, int(self.sim_time * 1000),
@@ -840,6 +963,42 @@ class BoatSimulatorApp:
             self._draw()
         self.root.after(20, self._tick)
 
+    def _cloud_points(
+        self,
+        points: list[tuple[float, float]],
+        to_screen,
+        width: int,
+        height: int,
+        limit: int,
+        min_gap_px: float = 3.0,
+        window: int = 4,
+    ) -> list[tuple[float, float]]:
+        """点云(oval 团)的绘制筛选: 视口剔除 + 屏幕空间抽稀 + 数量限幅。
+
+        - 视口剔除: 屏幕坐标落在画布外(留 8px 边距)的点不创建 item
+          (Tk 对看不见的 item 一样照收, 纯浪费)
+        - 屏幕空间抽稀: 与上一个入选点屏幕距离不足 min_gap_px 的跳过,
+          密的区域自动变疏、疏的区域保留细节, 轮廓形状不变
+        - 数量限幅: 最多返回 limit 个; 只扫描最新的 window*limit 个点
+          (更旧的点基本已驶出视野), 避免每帧全量遍历长缓冲
+
+        缓冲存多久不影响每帧成本: 30 分钟和一分钟的点云, 画出的 oval 一样多。"""
+        margin = 8.0
+        candidates = points[-(window * limit):] if len(points) > window * limit else points
+        kept: list[tuple[float, float]] = []
+        last_x = last_y = 0.0
+        for east, north in reversed(candidates):  # 新的优先, 越旧越先被舍弃
+            x, y = to_screen(east, north)
+            if not (-margin <= x <= width + margin and -margin <= y <= height + margin):
+                continue
+            if kept and math.hypot(x - last_x, y - last_y) < min_gap_px:
+                continue
+            kept.append((x, y))
+            last_x, last_y = x, y
+            if len(kept) >= limit:
+                break
+        return kept
+
     @staticmethod
     def _display_points(points: list[tuple[float, float]], limit: int = 3000) -> list[tuple[float, float]]:
         if len(points) <= limit:
@@ -858,19 +1017,28 @@ class BoatSimulatorApp:
         route_points = [(point.east_m, point.north_m) for point in self.route.waypoints]
         scale = min(width, height) / (2.0 * self.view_extent)
         self.view_scale = scale
+        if self.follow_boat.get():
+            # 跟随模式: 镜头中心锁定船体位置(船开离原点后不用手动追)
+            self.view_center[0] = self.boat.state.east_m
+            self.view_center[1] = self.boat.state.north_m
 
         def xy(east: float, north: float) -> tuple[float, float]:
-            return width / 2 + east * scale, height / 2 - north * scale
+            return width / 2 + (east - self.view_center[0]) * scale, height / 2 - (north - self.view_center[1]) * scale
 
         grid_step = (1 if self.view_extent <= 6 else
                      2 if self.view_extent <= 12 else
                      5 if self.view_extent <= 25 else
                      10 if self.view_extent <= 60 else 20)
-        limit = int(self.view_extent // grid_step) * grid_step
-        for value in range(-limit, limit + 1, grid_step):
-            x, _ = xy(value, 0)
-            _, y = xy(0, value)
+        # 网格覆盖当前可见世界范围(镜头可平移, 不再以原点为界)
+        east_start = math.floor((self.view_center[0] - width / (2.0 * scale)) / grid_step)
+        east_end = math.ceil((self.view_center[0] + width / (2.0 * scale)) / grid_step)
+        north_start = math.floor((self.view_center[1] - height / (2.0 * scale)) / grid_step)
+        north_end = math.ceil((self.view_center[1] + height / (2.0 * scale)) / grid_step)
+        for index in range(east_start, east_end + 1):
+            x, _ = xy(index * grid_step, 0)
             canvas.create_line(x, 0, x, height, fill="#e5e7eb")
+        for index in range(north_start, north_end + 1):
+            _, y = xy(0, index * grid_step)
             canvas.create_line(0, y, width, y, fill="#e5e7eb")
         for obstacle in self.obstacles:
             if isinstance(obstacle, CircleObstacle):
@@ -893,16 +1061,14 @@ class BoatSimulatorApp:
                 canvas.create_oval(point[0] - 4, point[1] - 4, point[0] + 4, point[1] + 4, fill="#14b8a6", outline="")
                 canvas.create_text(point[0] + 7, point[1] - 7, text=str(index + 1), fill="#0f766e", anchor="sw")
         if len(self.true_path) >= 2:
-            display_path = self._display_points(self.true_path)
+            display_path = self._display_points(self.true_path, 1000)
             canvas.create_line(*(coord for point in display_path for coord in xy(*point)), fill="#2563eb", width=2)
-        for point in self.gps_path[-100:]:
-            gx, gy = xy(*point)
+        for gx, gy in self._cloud_points(self.gps_path, xy, width, height, 60, min_gap_px=4.0):
             canvas.create_oval(gx - 3, gy - 3, gx + 3, gy + 3, fill="#f59e0b", outline="")
         if len(self.ekf_path) >= 2:
-            display_ekf = self._display_points(self.ekf_path)
+            display_ekf = self._display_points(self.ekf_path, 1000)
             canvas.create_line(*(coord for point in display_ekf for coord in xy(*point)), fill="#16a34a", width=2)
-        for point in self.ekf_path[-200:]:
-            ex, ey = xy(*point)
+        for ex, ey in self._cloud_points(self.ekf_path, xy, width, height, 100):
             canvas.create_oval(ex - 2, ey - 2, ex + 2, ey + 2, fill="#16a34a", outline="")
         if self.plan_total and any(point is not None for point in self.plan_points):
             # 扫测计划点表(紫) + 当前目标点(红, 来自 0x83 的 current 下标); 稀疏抽样控元素数
@@ -911,6 +1077,8 @@ class BoatSimulatorApp:
                 if point is None:
                     continue
                 px, py = xy(point[1], point[0])
+                if not (-8 <= px <= width + 8 and -8 <= py <= height + 8):
+                    continue  # 视口外的计划点不创建 item
                 canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill="#7c3aed", outline="")
             status = self.nav_status
             if status is not None and 0 <= status.current < len(self.plan_points):
@@ -935,8 +1103,7 @@ class BoatSimulatorApp:
         canvas.create_line(tx, ty - 7, tx, ty + 7, fill="#16a34a", width=2)
         # 声呐回波点云(障碍轮廓, 深棕小点) + 当前双波束(橙实线=有回波, 浅橙虚线=无回波)
         # 点云显示上限 600: canvas 元素数是重绘成本的大头(曾致缩放时 GUI 卡顿饿死仿真)
-        for point in self._display_points(self.sonar_points, 600):
-            px, py = xy(*point)
+        for px, py in self._cloud_points(self.sonar_points, xy, width, height, 300, min_gap_px=2.5):
             canvas.create_oval(px - 1.5, py - 1.5, px + 1.5, py + 1.5, fill="#b45309", outline="")
         if self.last_sonar_beams:
             for origin, end, hit in self.last_sonar_beams:
