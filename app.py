@@ -287,6 +287,17 @@ class BoatSimulatorApp:
         self.canvas.bind("<Leave>", self._on_map_leave)
         self.canvas.bind("<Escape>", self._on_map_escape)
 
+        # 窗口最小高度按实际内容设定: 最高标签页 + 选项卡行 + 工具栏 + 窗体装饰。
+        # 高度不够时 tkinter 会压缩控件, 把标签页底部按钮整行藏掉(实测最高页需
+        # 692px, 全窗客户区 771px); 小屏适度让步, 优先保证窗口不超出屏幕。
+        self.root.update_idletasks()
+        tab_height = max(tab.winfo_reqheight() for tab in (operation_tab, setup_tab, survey_tab))
+        needed = tab_height + toolbar.winfo_reqheight() + 88
+        screen_height = self.root.winfo_screenheight()
+        min_height = max(600, min(needed, screen_height - 60))
+        self.root.minsize(900, min_height)
+        self.root.geometry(f"1200x{min(max(760, min_height), screen_height - 80)}")
+
     def _entry(self, parent: ttk.Widget, label: str, key: str, default: float) -> None:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=1)
