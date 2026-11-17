@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import threading
 import time
 
-from .protocol import EkfPosition, FrameParser, MotorCommand
+from .protocol import EkfPosition, FrameParser, MotorCommand, NavStatus, PlanSegment
 
 try:
     import serial
@@ -19,6 +19,8 @@ class LinkStats:
     last_motor_monotonic: float = 0.0
     received_motor_frames: int = 0
     received_ekf_frames: int = 0
+    received_status_frames: int = 0
+    received_plan_segments: int = 0
     error: str = ""
 
 
@@ -29,6 +31,8 @@ class SerialLink:
         self.stats = LinkStats()
         self.latest_motor: MotorCommand | None = None
         self.latest_ekf: EkfPosition | None = None
+        self.latest_status: NavStatus | None = None
+        self.plan_segments: list[PlanSegment] = []
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self.running = False
@@ -81,6 +85,17 @@ class SerialLink:
         with self.lock:
             return self.latest_ekf
 
+    def nav_status(self) -> NavStatus | None:
+        with self.lock:
+            return self.latest_status
+
+    def take_plan_segments(self) -> list[PlanSegment]:
+        """Drain pending 0x84 segments (FIFO)."""
+        with self.lock:
+            segments = self.plan_segments
+            self.plan_segments = []
+            return segments
+
     def _read_loop(self) -> None:
         while self.running:
             try:
@@ -95,9 +110,17 @@ class SerialLink:
                             self.latest_motor = message
                             self.stats.received_motor_frames += 1
                             self.stats.last_motor_monotonic = time.monotonic()
-                        else:
+                        elif isinstance(message, EkfPosition):
                             self.latest_ekf = message
                             self.stats.received_ekf_frames += 1
+                        elif isinstance(message, NavStatus):
+                            self.latest_status = message
+                            self.stats.received_status_frames += 1
+                        else:
+                            self.plan_segments.append(message)
+                            self.stats.received_plan_segments += 1
+                            if len(self.plan_segments) > 512:
+                                del self.plan_segments[:256]
             except Exception as exc:
                 self.stats.error = str(exc)
                 self.running = False

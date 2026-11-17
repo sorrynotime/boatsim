@@ -28,11 +28,11 @@ def gps_to_local(latitude_deg: float, longitude_deg: float, lat0_deg: float, lon
 
 @dataclass
 class BoatParameters:
-    mass_kg: float = 5.0
-    motor_spacing_m: float = 0.15
-    max_speed_mps: float = 1.2
-    max_yaw_rate_rps: float = 1.2
-    max_motor_thrust_n: float = 35.0
+    mass_kg: float = 2.0
+    motor_spacing_m: float = 0.20
+    max_speed_mps: float = 1.0
+    max_yaw_rate_rps: float = 1.5
+    max_motor_thrust_n: float = 4.0
     motor_time_constant_s: float = 0.25
 
 

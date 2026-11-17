@@ -7,10 +7,22 @@ from tkinter import messagebox, ttk
 
 from boat_sim.model import BoatParameters, DifferentialBoat, GpsSensor, gps_to_local, local_to_gps
 from boat_sim.collision import CircleObstacle, PolygonObstacle, resolve_motion
-from boat_sim.protocol import encode_sensor, encode_target
+from boat_sim.protocol import (
+    NAV_CMD_PLAN_EXECUTE,
+    NAV_CMD_PLAN_RESEND,
+    NAV_CMD_STOP,
+    NAV_CMD_SURVEY_PLAN,
+    encode_nav_config,
+    encode_nav_frame,
+    encode_nav_task,
+    encode_range,
+    encode_sensor,
+    encode_target,
+)
 from boat_sim.route import MAX_WAYPOINTS, RoutePlan, Waypoint
 from boat_sim.serial_link import SerialLink
 from boat_sim.signal_mapping import map_motor_commands, map_yaw_angle
+from boat_sim.sonar import SonarConfig, synthesize_sonar, transducer_beams
 
 
 SIM_DT = 0.01
@@ -42,6 +54,24 @@ class BoatSimulatorApp:
         self.last_gps_time = -self._gps_period_s()
         self.last_sensor_send = -SIM_DT
         self.sequence = 0
+        # --- 导航扩展(0x10~0x13 下发 / 0x83 0x84 接收)的会话与采集状态 ---
+        self.nav_session = 0        # 连接时生成的非零会话号(MCU FRAME 帧校验)
+        self.nav_frame_id = 1
+        self.nav_request = 0        # TASK 请求号, 单调递增(MCU 去重)
+        self.last_range_send = -0.1
+        self.nav_status = None      # 最近一帧 0x83
+        self.plan_points: list[tuple[float, float] | None] = []  # (north, east) 按下标
+        self.plan_have: set[int] = set()
+        self.plan_total = 0
+        self.plan_id = 0
+        self.plan_final_seen = False
+        self.plan_complete = False
+        self.plan_last_resend_s = 0.0
+        self.plan_last_segment_s = 0.0
+        # --- 声呐可视化: 最近一次波束(画线) + 回波点云(轮廓) ---
+        self.last_sonar_beams: list[tuple[tuple[float, float], tuple[float, float], bool]] | None = None
+        self.last_sonar_text: tuple[float, float, int] | None = None   # (left_m, right_m, hit)
+        self.sonar_points: list[tuple[float, float]] = []
         self.latest_gps = (30.000000, 120.000000)
         self.true_path: list[tuple[float, float]] = []
         self.gps_path: list[tuple[float, float]] = []
@@ -71,6 +101,9 @@ class BoatSimulatorApp:
         self.connect_button.pack(side="left", padx=(4, 12))
         self.manual_mode = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="本地手动电机", variable=self.manual_mode).pack(side="left")
+        self.view_var = tk.StringVar(value="视野 40m")
+        ttk.Label(toolbar, textvariable=self.view_var).pack(side="left", padx=(12, 0))
+        ttk.Button(toolbar, text="视野复位", command=self._reset_view).pack(side="left", padx=(4, 0))
         self.status_var = tk.StringVar(value="未连接 / 已停止")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="right")
 
@@ -85,18 +118,20 @@ class BoatSimulatorApp:
         control_tabs.pack(fill="x")
         operation_tab = ttk.Frame(control_tabs, padding=4)
         setup_tab = ttk.Frame(control_tabs, padding=4)
+        survey_tab = ttk.Frame(control_tabs, padding=4)
         control_tabs.add(operation_tab, text="目标与电机")
         control_tabs.add(setup_tab, text="参数与方向")
+        control_tabs.add(survey_tab, text="扫测任务")
 
         params = ttk.LabelFrame(setup_tab, text="船体参数", padding=6)
         params.pack(fill="x")
-        self._entry(params, "质量 (kg)", "mass", 5.0)
-        self._entry(params, "电机间距 (m)", "spacing", 0.15)
-        self._entry(params, "最大速度 (m/s)", "max_speed", 1.2)
-        self._entry(params, "最大转向速度 (rad/s)", "max_yaw", 1.2)
-        self._entry(params, "单电机最大推力 (N)", "max_thrust", 35.0)
+        self._entry(params, "质量 (kg)", "mass", 2.0)
+        self._entry(params, "电机间距 (m)", "spacing", 0.20)
+        self._entry(params, "最大速度 (m/s)", "max_speed", 1.0)
+        self._entry(params, "最大转向速度 (rad/s)", "max_yaw", 1.5)
+        self._entry(params, "单电机最大推力 (N)", "max_thrust", 4.0)
         self._entry(params, "电机响应时间 (s)", "motor_tau", 0.25)
-        self._entry(params, "船体碰撞半径 (m)", "collision_radius", 0.80)
+        self._entry(params, "船体碰撞半径 (m)", "collision_radius", 0.15)
         ttk.Button(params, text="应用参数", command=self._apply_parameters).pack(fill="x", pady=(4, 0))
 
         location = ttk.LabelFrame(operation_tab, text="坐标与目标", padding=6)
@@ -161,6 +196,41 @@ class BoatSimulatorApp:
         ttk.Checkbutton(mapping, text="左电机取反", variable=self.invert_left_motor).pack(anchor="w")
         ttk.Checkbutton(mapping, text="右电机取反", variable=self.invert_right_motor).pack(anchor="w")
 
+        sonar = ttk.LabelFrame(setup_tab, text="声呐仿真 (RANGE 10Hz 自动下发)", padding=6)
+        sonar.pack(fill="x", pady=(6, 0))
+        self._entry(sonar, "量程 (m)", "sonar_range", 5.0)
+        self._entry(sonar, "波束全宽 (°)", "sonar_beam_deg", 60.0)
+        self._entry(sonar, "双轴夹角 (°)", "sonar_axis_deg", 40.0)
+        self._entry(sonar, "前置距离 (m)", "sonar_forward", 0.15)
+        self._entry(sonar, "横向偏置 (m)", "sonar_lateral", 0.005)
+        ttk.Button(sonar, text="下发 CONFIG", command=self._send_nav_config).pack(fill="x", pady=(4, 0))
+
+        survey = ttk.LabelFrame(survey_tab, text="同心圆扫测 (两阶段: 规划 → 人审 → 执行)", padding=6)
+        survey.pack(fill="x")
+        self._entry(survey, "圈距 (m)", "survey_step", 3.0)
+        self._entry(survey, "点距 (m)", "survey_spacing", 6.0)
+        self._entry(survey, "离岸距离 (m)", "survey_launch", 3.0)
+        self._entry(survey, "外圈半径 (m)", "survey_radius", 30.0)
+        self._entry(survey, "到点容差 (m)", "survey_tol", 1.5)
+        survey_actions = ttk.Frame(survey)
+        survey_actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(survey_actions, text="开始规划", command=self._send_survey_plan).pack(
+            side="left", fill="x", expand=True)
+        self.execute_button = ttk.Button(survey_actions, text="确认执行",
+                                         command=self._confirm_plan_execute, state="disabled")
+        self.execute_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        survey_actions2 = ttk.Frame(survey)
+        survey_actions2.pack(fill="x", pady=(4, 0))
+        ttk.Button(survey_actions2, text="重传点表", command=self._request_plan_resend).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(survey_actions2, text="停止", command=self._send_nav_stop).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(survey_tab, text="重建会话 (MCU 复位后先点这个)",
+                   command=self._establish_nav_session).pack(fill="x", pady=(6, 0))
+        self.survey_status_var = tk.StringVar(value="未规划")
+        ttk.Label(survey_tab, textvariable=self.survey_status_var,
+                  wraplength=220, justify="left").pack(fill="x", pady=(6, 0))
+
         self.telemetry_var = tk.StringVar()
         ttk.Label(controls, textvariable=self.telemetry_var, justify="left").pack(fill="x", pady=(6, 0))
 
@@ -184,6 +254,8 @@ class BoatSimulatorApp:
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _event: self._draw())
         self.canvas.bind("<Button-1>", self._pick_target)
+        self.canvas.bind("<MouseWheel>", self._on_map_wheel)
+        self.canvas.bind("<Double-Button-1>", lambda _event: self._reset_view())
 
     def _entry(self, parent: ttk.Widget, label: str, key: str, default: float) -> None:
         row = ttk.Frame(parent)
@@ -204,6 +276,24 @@ class BoatSimulatorApp:
 
     def _value(self, key: str) -> float:
         return float(self.vars[key].get())
+
+    MAP_MIN_EXTENT_M = 5.0
+    MAP_MAX_EXTENT_M = MAP_HALF_EXTENT_M
+
+    def _reset_view(self) -> None:
+        self.view_extent = MAP_HALF_EXTENT_M
+        self.view_var.set("视野 40m")
+        # 不直接 _draw: 让 10Hz 的常规重绘接手, 避免连续操作触发重绘风暴饿死仿真循环
+
+    def _on_map_wheel(self, event: tk.Event) -> None:
+        """滚轮缩放视野(半宽 m): 上放大下缩小, 夹在 [5, 40]; 双击/按钮复位。
+        只改数值不立即重绘 —— 10Hz 常规重绘会跟上(滚轮连滚会触发重绘风暴,
+        曾把仿真循环饿出 600ms+ 声呐断流, MCU 侧 WD2 灭任务)。"""
+        if not event.delta:
+            return
+        factor = 1.15 ** (event.delta / 120.0)
+        self.view_extent = max(self.MAP_MIN_EXTENT_M, min(self.MAP_MAX_EXTENT_M, self.view_extent / factor))
+        self.view_var.set(f"视野 {self.view_extent:.0f}m")
 
     def _gps_period_s(self) -> float:
         try:
@@ -240,6 +330,7 @@ class BoatSimulatorApp:
         try:
             self.link.connect(self.port_combo.get())
             self.connect_button.configure(text="断开")
+            self._establish_nav_session()
             self._send_target()
         except Exception as exc:
             messagebox.showerror("连接失败", str(exc))
@@ -260,6 +351,7 @@ class BoatSimulatorApp:
         self.accumulator = 0.0
         self.last_gps_time = -self._gps_period_s()
         self.last_sensor_send = -SIM_DT
+        self.last_range_send = -0.1  # 漏了这句: 复位后 sim_time 归零而它保留旧值, RANGE 门控永假(PC 实测一帧不发)
         self.true_path.clear()
         self.gps_path.clear()
         self.ekf_path.clear()
@@ -267,7 +359,13 @@ class BoatSimulatorApp:
         self.last_ekf_frame = None
         self.arrival_since = None
         self.arrived = False
+        self._reset_plan_capture()
+        self.last_sonar_beams = None
+        self.last_sonar_text = None
+        self.sonar_points = []
         self.view_extent = MAP_HALF_EXTENT_M
+        if hasattr(self, "view_var"):
+            self.view_var.set("视野 40m")
         self.vars["manual_left"].set(0)
         self.vars["manual_right"].set(0)
         self._draw()
@@ -472,6 +570,172 @@ class BoatSimulatorApp:
             if len(self.ekf_path) > 20_000:
                 del self.ekf_path[:4_000]
 
+    # ------------------------------------------------------------------
+    # 导航扩展: 会话建立 / CONFIG / RANGE 已在 _simulate_step; 此处是
+    # 接收侧(0x83 状态 + 0x84 点表拼装)与两阶段任务的下发按钮。
+    # ------------------------------------------------------------------
+
+    def _establish_nav_session(self) -> None:
+        """连接后建立导航会话: 生成非零 session, 下发 FRAME(0x10) + CONFIG(0x13)。
+
+        MCU 导航引擎只有认了 FRAME 才收 RANGE/TASK/CONFIG; 每次连接重新生成
+        session, 旧会话的任务与重发请求随之全部失效(防跨连接误执行)。"""
+        if not self.link.connected:
+            messagebox.showerror("导航", "请先连接串口")
+            return
+        self.nav_session = (int(time.time() * 1000) & 0x7FFFFFFF) or 1
+        self.nav_request = 0
+        self._reset_plan_capture()
+        frame = encode_nav_frame(self.sequence, self.nav_session, int(self.sim_time * 1000),
+                                 self._value("lat0"), self._value("lon0"), self.nav_frame_id)
+        self.sequence += 1
+        self.link.send(frame)
+        self._send_nav_config()
+
+    def _sonar_config(self) -> SonarConfig:
+        return SonarConfig(
+            sensor_range=self._value("sonar_range"),
+            beam_width=math.radians(self._value("sonar_beam_deg")),
+            axis_gap=math.radians(self._value("sonar_axis_deg")),
+            sensor_forward=self._value("sonar_forward"),
+            sensor_lateral=self._value("sonar_lateral"),
+            boat_radius=self._value("collision_radius"),
+            margin=0.0,
+            max_v=self._value("max_speed"),
+            max_w=self._value("max_yaw"),
+            acceleration=0.5,
+            angular_acceleration=1.0,
+            lookahead=1.2,
+        )
+
+    def _send_nav_config(self) -> None:
+        if not self.nav_session:
+            return
+        config = self._sonar_config()
+        values = (config.sensor_range, config.beam_width, config.axis_gap,
+                  config.sensor_forward, config.sensor_lateral, config.boat_radius,
+                  config.margin, config.max_v, config.max_w, config.acceleration,
+                  config.angular_acceleration, config.lookahead)
+        frame = encode_nav_config(self.sequence, self.nav_session, int(self.sim_time * 1000),
+                                  values, self.nav_frame_id)
+        self.sequence += 1
+        self.link.send(frame)
+
+    def _reset_plan_capture(self) -> None:
+        self.plan_points = []
+        self.plan_have = set()
+        self.plan_total = 0
+        self.plan_id = 0
+        self.plan_final_seen = False
+        self.plan_complete = False
+        self.plan_last_resend_s = 0.0
+        self.plan_last_segment_s = 0.0
+        self._update_execute_button()
+
+    def _update_execute_button(self) -> None:
+        if hasattr(self, "execute_button"):
+            self.execute_button.configure(state="normal" if self.plan_complete else "disabled")
+
+    def _capture_nav(self) -> None:
+        """每 tick: 收 0x83 状态, 拼装 0x84 点表; 末段已到但拼不齐、或 3s 无新段且不齐 → 重传。"""
+        status = self.link.nav_status()
+        if status is not None:
+            self.nav_status = status
+        received_any = False
+        for segment in self.link.take_plan_segments():
+            received_any = True
+            if self.plan_id and segment.plan_id != self.plan_id:
+                self._reset_plan_capture()  # 新一次规划到来, 旧表作废
+            if not self.plan_id:
+                self.plan_id = segment.plan_id
+                self.plan_total = segment.total
+                self.plan_points = [None] * segment.total
+            if segment.total != self.plan_total or segment.total <= 0:
+                continue
+            for offset, point in enumerate(segment.points):
+                index = segment.start_index + offset
+                if 0 <= index < self.plan_total:
+                    self.plan_points[index] = point
+            self.plan_have.add(segment.start_index)
+            if segment.flags & 1:
+                self.plan_final_seen = True
+        if received_any:
+            self.plan_last_segment_s = self.sim_time
+        if self.plan_total and not self.plan_complete:
+            have = sum(1 for point in self.plan_points if point is not None)
+            if have >= self.plan_total:
+                self.plan_complete = True
+                self._update_execute_button()
+            elif self.sim_time - max(self.plan_last_segment_s, self.plan_last_resend_s) >= 3.0:
+                # 末段丢了收不到 final 标志也照样兜底: 3 秒没有新段且仍不齐 → 整表重传
+                self.plan_last_resend_s = self.sim_time
+                self._request_plan_resend()
+        self._refresh_survey_status()
+
+    def _refresh_survey_status(self) -> None:
+        if not hasattr(self, "survey_status_var"):
+            return
+        status = self.nav_status
+        if status is None:
+            self.survey_status_var.set("MCU 状态: 尚未收到 0x83 帧")
+            return
+        have = sum(1 for point in self.plan_points if point is not None) if self.plan_total else 0
+        plan_text = f"点表 {have}/{self.plan_total}" if self.plan_total else "点表: 未收到"
+        if self.plan_complete:
+            plan_text += " 已收齐, 可确认执行"
+        self.survey_status_var.set(
+            f"MCU 状态: {status.state_name}   ACK: {status.ack_name}\n"
+            f"运行: {'是' if status.running else '否'}   当前点: {status.current + 1}/{status.total}\n"
+            f"到达 {status.visited} / 判岸 {status.shore} / 跳过 {status.skipped}\n"
+            f"{plan_text}\n"
+            f"命令拒绝 {status.rejected}   声呐拒绝 {status.range_rejected}   重排 {status.replans}"
+        )
+
+    def _send_survey_plan(self) -> None:
+        if not self.nav_session:
+            messagebox.showerror("扫测", "请先连接串口(自动建立导航会话)")
+            return
+        try:
+            args = [self._value(key) for key in
+                    ("survey_step", "survey_spacing", "survey_launch", "survey_radius", "survey_tol")]
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("扫测参数错误", str(exc))
+            return
+        self._reset_plan_capture()
+        self.nav_request += 1
+        frame = encode_nav_task(self.sequence, self.nav_session, int(self.sim_time * 1000),
+                                NAV_CMD_SURVEY_PLAN, self.nav_request, args, frame_id=self.nav_frame_id)
+        self.sequence += 1
+        self.link.send(frame)
+
+    def _confirm_plan_execute(self) -> None:
+        if not self.plan_complete:
+            messagebox.showinfo("扫测", "点表尚未收齐, 不能执行")
+            return
+        self.nav_request += 1
+        frame = encode_nav_task(self.sequence, self.nav_session, int(self.sim_time * 1000),
+                                NAV_CMD_PLAN_EXECUTE, self.nav_request, frame_id=self.nav_frame_id)
+        self.sequence += 1
+        self.link.send(frame)
+
+    def _request_plan_resend(self) -> None:
+        if not self.nav_session:
+            return
+        self.nav_request += 1
+        frame = encode_nav_task(self.sequence, self.nav_session, int(self.sim_time * 1000),
+                                NAV_CMD_PLAN_RESEND, self.nav_request, frame_id=self.nav_frame_id)
+        self.sequence += 1
+        self.link.send(frame)
+
+    def _send_nav_stop(self) -> None:
+        if not self.nav_session:
+            return
+        self.nav_request += 1
+        frame = encode_nav_task(self.sequence, self.nav_session, int(self.sim_time * 1000),
+                                NAV_CMD_STOP, self.nav_request, frame_id=self.nav_frame_id)
+        self.sequence += 1
+        self.link.send(frame)
+
     def _simulate_step(self) -> None:
         left, right, _ = self._motor_values()
         previous_position = (self.boat.state.east_m, self.boat.state.north_m)
@@ -523,6 +787,35 @@ class BoatSimulatorApp:
             )
             self.sequence += 1
             self.link.send(frame)
+        if self.nav_session and self.sim_time - self.last_range_send >= 0.1 - 1e-9:
+            # 导航声呐: 每 100ms 对世界障碍物做双波束射线求交, 打成 RANGE(0x11) 下发。
+            # 无回波通道按协议约定回 满量程 + hit=0(有效无回波), 不是无效通道。
+            self.last_range_send = self.sim_time
+            config = self._sonar_config()
+            sample = synthesize_sonar(state, config, self.obstacles)
+            self.last_sonar_text = (sample.left_m, sample.right_m, sample.hit)
+            (left, right) = transducer_beams(state, config)
+            beams = []
+            for (origin, bearing), distance, hit_bit in ((left, sample.left_m, 1),
+                                                         (right, sample.right_m, 2)):
+                hit = bool(sample.hit & hit_bit)
+                end = (origin[0] + math.sin(bearing) * distance,
+                       origin[1] + math.cos(bearing) * distance)
+                beams.append((origin, end, hit))
+                if hit:
+                    # 回波端点入点云: 船边扫过的障碍表面会逐渐连成轮廓
+                    if not self.sonar_points or math.dist(self.sonar_points[-1], end) >= 0.05:
+                        self.sonar_points.append(end)
+                        if len(self.sonar_points) > 6000:
+                            del self.sonar_points[:2000]
+            self.last_sonar_beams = beams
+            frame = encode_range(
+                self.sequence, self.nav_session, int(self.sim_time * 1000),
+                sample.valid, sample.hit, sample.left_m, sample.right_m,
+                sample.max_range, self.nav_frame_id,
+            )
+            self.sequence += 1
+            self.link.send(frame)
         distance = math.hypot(state.east_m - self._value("target_east"), state.north_m - self._value("target_north"))
         if distance <= self._value("arrival_radius"):
             self.arrival_since = self.arrival_since if self.arrival_since is not None else self.sim_time
@@ -536,6 +829,7 @@ class BoatSimulatorApp:
         elapsed = min(0.1, now - self.last_tick)
         self.last_tick = now
         self._capture_ekf_point()
+        self._capture_nav()
         if self.running:
             self.accumulator += elapsed
             while self.accumulator >= SIM_DT:
@@ -562,14 +856,16 @@ class BoatSimulatorApp:
         canvas.delete("all")
         target = (self._value("target_east"), self._value("target_north"))
         route_points = [(point.east_m, point.north_m) for point in self.route.waypoints]
-        self.view_extent = MAP_HALF_EXTENT_M
         scale = min(width, height) / (2.0 * self.view_extent)
         self.view_scale = scale
 
         def xy(east: float, north: float) -> tuple[float, float]:
             return width / 2 + east * scale, height / 2 - north * scale
 
-        grid_step = 5 if self.view_extent <= 40 else 10 if self.view_extent <= 100 else 50
+        grid_step = (1 if self.view_extent <= 6 else
+                     2 if self.view_extent <= 12 else
+                     5 if self.view_extent <= 25 else
+                     10 if self.view_extent <= 60 else 20)
         limit = int(self.view_extent // grid_step) * grid_step
         for value in range(-limit, limit + 1, grid_step):
             x, _ = xy(value, 0)
@@ -608,6 +904,21 @@ class BoatSimulatorApp:
         for point in self.ekf_path[-200:]:
             ex, ey = xy(*point)
             canvas.create_oval(ex - 2, ey - 2, ex + 2, ey + 2, fill="#16a34a", outline="")
+        if self.plan_total and any(point is not None for point in self.plan_points):
+            # 扫测计划点表(紫) + 当前目标点(红, 来自 0x83 的 current 下标); 稀疏抽样控元素数
+            stride = 2 if self.plan_total > 150 else 1
+            for point in self.plan_points[::stride]:
+                if point is None:
+                    continue
+                px, py = xy(point[1], point[0])
+                canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill="#7c3aed", outline="")
+            status = self.nav_status
+            if status is not None and 0 <= status.current < len(self.plan_points):
+                current = self.plan_points[status.current]
+                if current is not None:
+                    cx, cy = xy(current[1], current[0])
+                    canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
+                                       fill="#dc2626", outline="#7f1d1d")
         if len(route_points) >= 2:
             canvas.create_line(*(coord for point in route_points for coord in xy(*point)), fill="#475569", width=2, dash=(5, 3))
         for index, point in enumerate(route_points):
@@ -622,6 +933,21 @@ class BoatSimulatorApp:
         canvas.create_oval(tx - radius_px, ty - radius_px, tx + radius_px, ty + radius_px, outline="#16a34a", width=2)
         canvas.create_line(tx - 7, ty, tx + 7, ty, fill="#16a34a", width=2)
         canvas.create_line(tx, ty - 7, tx, ty + 7, fill="#16a34a", width=2)
+        # 声呐回波点云(障碍轮廓, 深棕小点) + 当前双波束(橙实线=有回波, 浅橙虚线=无回波)
+        # 点云显示上限 600: canvas 元素数是重绘成本的大头(曾致缩放时 GUI 卡顿饿死仿真)
+        for point in self._display_points(self.sonar_points, 600):
+            px, py = xy(*point)
+            canvas.create_oval(px - 1.5, py - 1.5, px + 1.5, py + 1.5, fill="#b45309", outline="")
+        if self.last_sonar_beams:
+            for origin, end, hit in self.last_sonar_beams:
+                ox, oy = xy(*origin)
+                ex, ey = xy(*end)
+                if hit:
+                    canvas.create_line(ox, oy, ex, ey, fill="#f97316", width=2)
+                    canvas.create_oval(ex - 3, ey - 3, ex + 3, ey + 3,
+                                       fill="#f97316", outline="#7c2d12")
+                else:
+                    canvas.create_line(ox, oy, ex, ey, fill="#fdba74", dash=(4, 4))
         state = self.boat.state
         bx, by = xy(state.east_m, state.north_m)
         forward = (math.sin(state.yaw_rad), -math.cos(state.yaw_rad))
@@ -633,20 +959,27 @@ class BoatSimulatorApp:
                 by + forward[1] * forward_m + right[1] * lateral_m,
             )
 
-        # A compact top-down hull: pointed bow, squared stern, deck and two props.
-        hull = [hull_point(23, 0), hull_point(10, -11), hull_point(-16, -10), hull_point(-19, 0),
-                hull_point(-16, 10), hull_point(10, 11)]
+        # 真实比例船体: 0.45m 长 / 0.2m 宽(与船体参数一致), 带最小像素下限保证可见。
+        # 80m 视图(约 10px/m)下真实尺寸只有 ~4.5x2px, 贴 12x6px 下限; 视图放大后按比例生长。
+        boat_len = max(12.0, 0.45 * scale)
+        boat_wid = max(6.0, 0.20 * scale)
+        hull = [hull_point(boat_len * 0.55, 0), hull_point(boat_len * 0.24, -boat_wid / 2),
+                hull_point(-boat_len * 0.38, -boat_wid * 0.45), hull_point(-boat_len * 0.45, 0),
+                hull_point(-boat_len * 0.38, boat_wid * 0.45), hull_point(boat_len * 0.24, boat_wid / 2)]
         canvas.create_polygon(*(coord for point in hull for coord in point), fill="#0f4c81", outline="#082f49", width=2)
-        deck = [hull_point(10, 0), hull_point(4, -7), hull_point(-10, -7), hull_point(-13, 0),
-                hull_point(-10, 7), hull_point(4, 7)]
+        deck = [hull_point(boat_len * 0.24, 0), hull_point(boat_len * 0.10, -boat_wid * 0.32),
+                hull_point(-boat_len * 0.24, -boat_wid * 0.32), hull_point(-boat_len * 0.31, 0),
+                hull_point(-boat_len * 0.24, boat_wid * 0.32), hull_point(boat_len * 0.10, boat_wid * 0.32)]
         canvas.create_polygon(*(coord for point in deck for coord in point), fill="#38bdf8", outline="#0c4a6e")
-        cabin = [hull_point(6, -4.5), hull_point(1, -4.5), hull_point(-5, -3.5), hull_point(-5, 3.5),
-                 hull_point(1, 4.5), hull_point(6, 4.5)]
+        cabin = [hull_point(boat_len * 0.14, -boat_wid * 0.20), hull_point(boat_len * 0.02, -boat_wid * 0.20),
+                 hull_point(-boat_len * 0.12, -boat_wid * 0.16), hull_point(-boat_len * 0.12, boat_wid * 0.16),
+                 hull_point(boat_len * 0.02, boat_wid * 0.20), hull_point(boat_len * 0.14, boat_wid * 0.20)]
         canvas.create_polygon(*(coord for point in cabin for coord in point), fill="#e0f2fe", outline="#075985")
-        for lateral in (-8, 8):
-            px, py = hull_point(-15, lateral)
-            canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill="#f59e0b", outline="#92400e")
-        canvas.create_line(bx, by, *hull_point(30, 0), fill="#f97316", width=2)
+        prop_r = max(1.5, boat_wid * 0.16)
+        for lateral in (-boat_wid * 0.36, boat_wid * 0.36):
+            px, py = hull_point(-boat_len * 0.36, lateral)
+            canvas.create_oval(px - prop_r, py - prop_r, px + prop_r, py + prop_r, fill="#f59e0b", outline="#92400e")
+        canvas.create_line(bx, by, *hull_point(boat_len * 0.7, 0), fill="#f97316", width=2)
         distance = math.hypot(state.east_m - target[0], state.north_m - target[1])
         raw_left, raw_right, source = self._raw_motor_values()
         left, right, _ = self._motor_values()
@@ -657,6 +990,12 @@ class BoatSimulatorApp:
             f"{self.latest_ekf_gps[0]:.7f}, {self.latest_ekf_gps[1]:.7f}"
             if self.latest_ekf_gps is not None else "--"
         )
+        if self.last_sonar_text is None:
+            sonar_text = "-- / --"
+        else:
+            left_m, right_m, hit = self.last_sonar_text
+            sonar_text = (f"{left_m:.2f}{'*' if hit & 1 else ''} / "
+                          f"{right_m:.2f}{'*' if hit & 2 else ''} m (*=有回波)")
         self.status_var.set(f"{link_state} / {run_state}{arrived}")
         self.telemetry_var.set(
             f"输入：{source}\n原始左/右：{raw_left} / {raw_right}\n仿真左/右：{left} / {right}\n"
@@ -665,8 +1004,10 @@ class BoatSimulatorApp:
             f"角速度：{state.yaw_rate_rps:.2f} rad/s\n目标距离：{distance:.2f} m\n"
             f"GPS：{self.latest_gps[0]:.7f}, {self.latest_gps[1]:.7f}\n"
             f"EKF：{ekf_text}\n"
+            f"声呐 左/右：{sonar_text}\n"
             f"电机帧：{self.link.stats.received_motor_frames}\n"
             f"EKF 帧：{self.link.stats.received_ekf_frames}\n"
+            f"回波点：{len(self.sonar_points)}\n"
             f"障碍物：{len(self.obstacles)} / {self.collision_status}"
         )
 

@@ -12,11 +12,41 @@ MSG_MOTOR_COMMAND = 0x81
 MSG_EKF_POSITION = 0x82
 FLAG_GPS_NEW = 0x0001
 
+# --- Navigation extension (MCU rs_lib/navigation, see ag3335 UART2_NAV_PROTOCOL docs) ---
+MSG_NAV_FRAME = 0x10   # PC -> MCU: session/origin, establishes the nav frame
+MSG_NAV_RANGE = 0x11   # PC -> MCU: dual-beam sonar sample (10 Hz)
+MSG_NAV_TASK = 0x12    # PC -> MCU: mission command (48 B)
+MSG_NAV_CONFIG = 0x13  # PC -> MCU: sensor/boat configuration (60 B)
+MSG_NAV_STATUS = 0x83  # MCU -> PC: navigation status (48 B, 10 Hz)
+MSG_NAV_PLAN = 0x84    # MCU -> PC: plan waypoint segment (12 + 8N, N <= 6)
+
+NAV_CMD_STOP = 0
+NAV_CMD_CLEAR = 1
+NAV_CMD_POINT = 2
+NAV_CMD_START = 3
+NAV_CMD_SURVEY = 4
+NAV_CMD_SURVEY_PLAN = 6
+NAV_CMD_PLAN_EXECUTE = 7
+NAV_CMD_PLAN_RESEND = 8
+
+NAV_COORD_NORTH_EAST = 1
+NAV_PROTOCOL_REV = 1
+NAV_STATUS_SIZE = 48
+NAV_TASK_SIZE = 48
+NAV_CONFIG_SIZE = 60
+NAV_PLAN_HEADER_SIZE = 12
+NAV_PLAN_POINTS_PER_FRAME = 6
+
 HEADER = struct.Struct("<2sBBHH")
 SENSOR_PAYLOAD = struct.Struct("<IHffiif")
 TARGET_PAYLOAD = struct.Struct("<Iiif")
 MOTOR_PAYLOAD = struct.Struct("<Ihh")
 EKF_POSITION_PAYLOAD = struct.Struct("<Iii")
+NAV_FRAME_PAYLOAD = struct.Struct("<IIiiHBB")
+NAV_RANGE_PAYLOAD = struct.Struct("<IIHBBfff")
+NAV_TASK_PAYLOAD = struct.Struct("<IIHBBI8f")
+NAV_CONFIG_PAYLOAD = struct.Struct("<IIHBB12f")
+NAV_STATUS_PAYLOAD = struct.Struct("<IIBBBB6H4I2f")  # 4+4+4B+12+16+8 = 48
 
 
 def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
@@ -69,6 +99,76 @@ def encode_target(sequence: int, time_ms: int, latitude_deg: float, longitude_de
     )
 
 
+def encode_nav_frame(sequence: int, session: int, time_ms: int, latitude_deg: float,
+                     longitude_deg: float, frame_id: int = 1) -> bytes:
+    return encode_frame(
+        MSG_NAV_FRAME,
+        sequence,
+        NAV_FRAME_PAYLOAD.pack(
+            session & 0xFFFFFFFF,
+            time_ms & 0xFFFFFFFF,
+            round(latitude_deg * 10_000_000),
+            round(longitude_deg * 10_000_000),
+            frame_id & 0xFFFF,
+            NAV_COORD_NORTH_EAST,
+            NAV_PROTOCOL_REV,
+        ),
+    )
+
+
+def encode_range(sequence: int, session: int, time_ms: int, valid: int, hit: int,
+                 left_m: float, right_m: float, max_range_m: float, frame_id: int = 1) -> bytes:
+    return encode_frame(
+        MSG_NAV_RANGE,
+        sequence,
+        NAV_RANGE_PAYLOAD.pack(
+            session & 0xFFFFFFFF,
+            time_ms & 0xFFFFFFFF,
+            frame_id & 0xFFFF,
+            valid & 0xFF,
+            hit & 0xFF,
+            left_m,
+            right_m,
+            max_range_m,
+        ),
+    )
+
+
+def encode_nav_task(sequence: int, session: int, time_ms: int, command: int, request: int,
+                    args: list[float] | tuple[float, ...] = (), flags: int = 0, frame_id: int = 1) -> bytes:
+    values = list(args) + [0.0] * (8 - len(args))
+    return encode_frame(
+        MSG_NAV_TASK,
+        sequence,
+        NAV_TASK_PAYLOAD.pack(
+            session & 0xFFFFFFFF,
+            time_ms & 0xFFFFFFFF,
+            frame_id & 0xFFFF,
+            command & 0xFF,
+            flags & 0xFF,
+            request & 0xFFFFFFFF,
+            *values[:8],
+        ),
+    )
+
+
+def encode_nav_config(sequence: int, session: int, time_ms: int, values: list[float] | tuple[float, ...],
+                      frame_id: int = 1) -> bytes:
+    fields = list(values) + [0.0] * (12 - len(values))
+    return encode_frame(
+        MSG_NAV_CONFIG,
+        sequence,
+        NAV_CONFIG_PAYLOAD.pack(
+            session & 0xFFFFFFFF,
+            time_ms & 0xFFFFFFFF,
+            frame_id & 0xFFFF,
+            NAV_PROTOCOL_REV,
+            0,
+            *fields[:12],
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class MotorCommand:
     sequence: int
@@ -91,6 +191,83 @@ class EkfPosition:
     @property
     def ekf_longitude_deg(self) -> float:
         return self.ekf_longitude_e7 / 10_000_000.0
+
+
+NAV_STATE_NAMES = (
+    "IDLE", "READY", "SCAN_LAUNCH", "TRANSIT", "SCAN_CENTER", "FOLLOW",
+    "RESCAN", "DONE", "STOPPED", "FAULT", "REVIEW", "PLAN_WAIT",
+)
+
+NAV_ACK_NAMES = (
+    "OK", "FORMAT", "SESSION", "TIME", "STATE", "CAPACITY", "POSE",
+    "CONFIG", "QUEUE", "DUPLICATE",
+)
+
+
+@dataclass(frozen=True)
+class NavStatus:
+    """STATUS(0x83): navigation engine snapshot (48 B)."""
+    sequence: int
+    session: int
+    last_request: int
+    ack: int
+    state: int
+    running: int
+    flags: int          # bit0 engine owns motors, bit1 motion allowed & pose ready
+    total: int
+    current: int
+    visited: int
+    shore: int
+    skipped: int
+    pending: int
+    rejected: int
+    range_rejected: int
+    replans: int
+    queue_drops: int
+    command_v: float
+    command_w: float
+
+    @property
+    def state_name(self) -> str:
+        return NAV_STATE_NAMES[self.state] if 0 <= self.state < len(NAV_STATE_NAMES) else f"?{self.state}"
+
+    @property
+    def ack_name(self) -> str:
+        return NAV_ACK_NAMES[self.ack] if 0 <= self.ack < len(NAV_ACK_NAMES) else f"?{self.ack}"
+
+
+@dataclass(frozen=True)
+class PlanSegment:
+    """PLAN(0x84): one slice of the surveyed waypoint table (12 + 8N bytes)."""
+    sequence: int
+    session: int
+    plan_id: int
+    total: int
+    start_index: int
+    count: int
+    flags: int          # bit0 = final segment (PLAN_END)
+    points: tuple[tuple[float, float], ...]   # (north_m, east_m) per point
+
+
+def decode_nav_status(payload: bytes, sequence: int) -> NavStatus | None:
+    if len(payload) != NAV_STATUS_SIZE:
+        return None
+    fields = NAV_STATUS_PAYLOAD.unpack(payload)
+    return NavStatus(sequence, *fields)
+
+
+def decode_plan_segment(payload: bytes, sequence: int) -> PlanSegment | None:
+    if len(payload) < NAV_PLAN_HEADER_SIZE:
+        return None
+    count = payload[10]
+    if count > NAV_PLAN_POINTS_PER_FRAME or len(payload) != NAV_PLAN_HEADER_SIZE + 8 * count:
+        return None
+    session, plan_id, total, start_index = struct.unpack_from("<IHHH", payload, 0)
+    points: list[tuple[float, float]] = []
+    for index in range(count):
+        north, east = struct.unpack_from("<ff", payload, NAV_PLAN_HEADER_SIZE + 8 * index)
+        points.append((north, east))
+    return PlanSegment(sequence, session, plan_id, total, start_index, count, payload[11], tuple(points))
 
 
 class FrameParser:
@@ -125,8 +302,8 @@ class FrameParser:
             del self.buffer[:frame_length]
         return frames
 
-    def feed_messages(self, data: bytes) -> list[MotorCommand | EkfPosition]:
-        messages: list[MotorCommand | EkfPosition] = []
+    def feed_messages(self, data: bytes) -> list[MotorCommand | EkfPosition | NavStatus | PlanSegment]:
+        messages: list[MotorCommand | EkfPosition | NavStatus | PlanSegment] = []
         for message_type, sequence, payload in self.feed(data):
             if message_type == MSG_MOTOR_COMMAND and len(payload) == MOTOR_PAYLOAD.size:
                 time_ms, left, right = MOTOR_PAYLOAD.unpack(payload)
@@ -134,6 +311,14 @@ class FrameParser:
             elif message_type == MSG_EKF_POSITION and len(payload) == EKF_POSITION_PAYLOAD.size:
                 time_ms, latitude_e7, longitude_e7 = EKF_POSITION_PAYLOAD.unpack(payload)
                 messages.append(EkfPosition(sequence, time_ms, latitude_e7, longitude_e7))
+            elif message_type == MSG_NAV_STATUS:
+                message = decode_nav_status(payload, sequence)
+                if message is not None:
+                    messages.append(message)
+            elif message_type == MSG_NAV_PLAN:
+                message = decode_plan_segment(payload, sequence)
+                if message is not None:
+                    messages.append(message)
         return messages
 
     def feed_motor_commands(self, data: bytes) -> list[MotorCommand]:

@@ -9,7 +9,9 @@ class ModelTests(unittest.TestCase):
         boat = DifferentialBoat()
         for _ in range(500):
             boat.step(10000, 10000, 0.01)
-        self.assertGreater(boat.state.north_m, 5.0)
+        # 5s 满推: 位移应接近"稳态速度 x 时间"的九成以上, 且不依赖具体默认参数值
+        expected = boat.parameters.max_speed_mps * 5.0
+        self.assertGreater(boat.state.north_m, expected * 0.9)
         self.assertAlmostEqual(boat.state.east_m, 0.0, places=5)
         self.assertAlmostEqual(boat.state.yaw_rad, 0.0, places=5)
 
