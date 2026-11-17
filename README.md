@@ -22,11 +22,11 @@ Coordinates in the plot are local east/north metres. Yaw is zero at north and
 positive clockwise. GPS is selectable at 1/5/10 Hz (default 5 Hz); yaw and serial sensor frames run
 at 100 Hz. See [PROTOCOL.md](PROTOCOL.md) for the binary protocol.
 
-A two-row telemetry bar sits below the map. The upper row shows control and
-motion state (input source, raw and simulated motor commands, east/north, yaw,
-speed, yaw rate, target distance); the lower row shows sensors and link state
-(GPS fix, MCU EKF position, sonar left/right ranges with `*` marking an echo,
-motor and EKF frame counters, echo points, obstacles).
+Below the map, a telemetry dashboard shows fifteen boxed readouts in a 5 x 3
+grid: input source, raw and simulated motor commands, east/north, yaw, speed,
+yaw rate, target distance, GPS fix, MCU EKF position, sonar left/right ranges
+(`*` marks an echo), motor and EKF frame counters, echo points, and obstacles.
+The last column is wider to fit the GPS/EKF coordinates.
 
 Click the map to select a target. The selected local coordinate is converted to
 the directly pasteable `sim target <latitude> <longitude>` command and can be

@@ -257,15 +257,33 @@ class BoatSimulatorApp:
 
         self._build_route_window()
 
-        # 遥测栏: 放在地图下方, 横向两行排布(先前在左侧窄栏里, 内容多被整段藏住)
+        # 遥测栏: 地图下方, 每项一个方框(LabelFrame), 一行 5 项 grid 排齐;
+        # 最后一列加宽(GPS/EKF/障碍物文本较长)。共 15 项 = 3 整行。
         telemetry_bar = ttk.Frame(plot_frame, padding=(6, 3))
         telemetry_bar.pack(side="bottom", fill="x")
-        self.telemetry_row1_var = tk.StringVar()
-        self.telemetry_row2_var = tk.StringVar()
-        ttk.Label(telemetry_bar, textvariable=self.telemetry_row1_var, anchor="w",
-                  font=("TkDefaultFont", 9)).pack(fill="x")
-        ttk.Label(telemetry_bar, textvariable=self.telemetry_row2_var, anchor="w",
-                  font=("TkDefaultFont", 9)).pack(fill="x")
+        telemetry_specs = (
+            ("输入", "input"), ("原始", "raw"), ("仿真", "sim"), ("东/北", "position"),
+            ("航向", "yaw"), ("速度", "speed"), ("角速度", "yaw_rate"), ("目标", "target"),
+            ("GPS", "gps"), ("EKF", "ekf"), ("声呐", "sonar"), ("电机帧", "motor_frames"),
+            ("EKF帧", "ekf_frames"), ("回波", "echoes"), ("障碍物", "obstacles"),
+        )
+        self.telemetry_vars: dict[str, tk.StringVar] = {}
+        for index, (title, key) in enumerate(telemetry_specs):
+            row, column = divmod(index, 5)
+            # 用经典 tk.Frame 细边框做方框: ttk.LabelFrame 即使空文本也会预留一行
+            # 标签高度(实测 129px), 经典 Frame 同样式只有其一半, 底色与画布一致
+            cell = tk.Frame(telemetry_bar, bd=1, relief="solid", highlightthickness=1,
+                            highlightbackground="#9ca3af", bg="#f7fafc")
+            cell.grid(row=row, column=column, sticky="nsew", padx=(0, 3), pady=(0, 2))
+            tk.Label(cell, text=title, font=("TkDefaultFont", 9, "bold"),
+                     bg="#f7fafc", fg="#475569").pack(side="left", padx=(5, 2))
+            variable = tk.StringVar(value="--")
+            self.telemetry_vars[key] = variable
+            tk.Label(cell, textvariable=variable, font=("TkDefaultFont", 9),
+                     bg="#f7fafc", fg="#0f172a").pack(side="left", padx=(0, 5))
+        for column in range(4):
+            telemetry_bar.grid_columnconfigure(column, weight=10, uniform="telemetry")
+        telemetry_bar.grid_columnconfigure(4, weight=18, uniform="telemetry")
 
         self.canvas = tk.Canvas(plot_frame, background="#f7fafc", highlightthickness=1, highlightbackground="#9ca3af")
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -1325,19 +1343,26 @@ class BoatSimulatorApp:
             sonar_text = (f"{left_m:.1f}{'*' if hit & 1 else ''}/"
                           f"{right_m:.1f}{'*' if hit & 2 else ''} m")
         self.status_var.set(f"{link_state} / {run_state}{arrived}")
-        # 遥测栏两行: 上行=控制与运动, 下行=传感器与链路; * = 该通道有回波
-        self.telemetry_row1_var.set(
-            f"输入 {source} · 原始 {raw_left}/{raw_right} · 仿真 {left}/{right} · "
-            f"东/北 {state.east_m:.1f}/{state.north_m:.1f} m · 航向 {state.yaw_rad:.2f} rad · "
-            f"速度 {state.speed_mps:.2f} m/s · 角速度 {state.yaw_rate_rps:.2f} rad/s · "
-            f"目标距离 {distance:.1f} m"
-        )
-        self.telemetry_row2_var.set(
-            f"GPS {self.latest_gps[0]:.7f}, {self.latest_gps[1]:.7f} · EKF {ekf_text} · "
-            f"声呐 {sonar_text} · 电机帧 {self.link.stats.received_motor_frames} · "
-            f"EKF 帧 {self.link.stats.received_ekf_frames} · 回波点 {len(self.sonar_points)} · "
-            f"障碍物 {len(self.obstacles)} / {self.collision_status}"
-        )
+        # 遥测栏: 每项一个方框; * = 该声呐通道有回波
+        telemetry = {
+            "input": source,
+            "raw": f"{raw_left}/{raw_right}",
+            "sim": f"{left}/{right}",
+            "position": f"{state.east_m:.1f}/{state.north_m:.1f} m",
+            "yaw": f"{state.yaw_rad:.2f} rad",
+            "speed": f"{state.speed_mps:.2f} m/s",
+            "yaw_rate": f"{state.yaw_rate_rps:.2f} rad/s",
+            "target": f"{distance:.1f} m",
+            "gps": f"{self.latest_gps[0]:.7f}, {self.latest_gps[1]:.7f}",
+            "ekf": ekf_text,
+            "sonar": sonar_text,
+            "motor_frames": str(self.link.stats.received_motor_frames),
+            "ekf_frames": str(self.link.stats.received_ekf_frames),
+            "echoes": str(len(self.sonar_points)),
+            "obstacles": f"{len(self.obstacles)} / {self.collision_status}",
+        }
+        for key, value in telemetry.items():
+            self.telemetry_vars[key].set(value)
 
     def _close(self) -> None:
         self.link.disconnect()
